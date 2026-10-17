@@ -1,0 +1,35 @@
+# OpenAPI Overlay applied by oapi-codegen before generation.
+# The pinned upstream spec (rest-catalog-open-api.yaml) is never edited by hand;
+# every fix needed for code generation lives here, with a reason.
+overlay: 1.0.0
+info:
+  title: echpochmak codegen fixes for the Iceberg REST catalog spec
+  version: 1.0.0
+actions:
+  # The path parameter `namespace` and the schema `Namespace` both map to the
+  # Go type name `Namespace`; oapi-codegen refuses to auto-rename them.
+  - target: $.components.parameters.namespace
+    update:
+      x-go-name: NamespaceParam
+
+  # Upstream bug: response headers reference a *parameter*
+  # (#/components/parameters/etag), which is not a valid Header Object.
+  # Replace the reference with an inline header definition.
+  - target: $.components.responses.CreateTableResponse.headers.etag
+    remove: true
+  - target: $.components.responses.LoadTableResponse.headers.etag
+    remove: true
+  - target: $.components.responses.CommitTableResponse.headers.etag
+    remove: true
+  - target: $.components.responses.CreateTableResponse.headers
+    update:
+      etag: &etag
+        description: Identifies a unique version of the table metadata.
+        schema:
+          type: string
+  - target: $.components.responses.LoadTableResponse.headers
+    update:
+      etag: *etag
+  - target: $.components.responses.CommitTableResponse.headers
+    update:
+      etag: *etag

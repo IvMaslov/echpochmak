@@ -1,0 +1,236 @@
+# golangci-lint v2 configuration.
+#
+# Based on the community "golden config" by maratori
+# (https://gist.github.com/maratori/47a4d00457a92aa426dbd48a18776322),
+# adjusted to this project and to .claude/skills/go-code-style.md.
+# Run with `make lint`; format with `make fmt`.
+
+version: "2"
+
+run:
+  timeout: 5m
+  modules-download-mode: readonly
+
+issues:
+  # Report everything: a lint gate is only useful at zero issues.
+  max-issues-per-linter: 0
+  max-same-issues: 0
+
+formatters:
+  enable:
+    - gofumpt
+    - goimports
+  settings:
+    gofumpt:
+      # The module path has no dot, so gofumpt would otherwise mistake our
+      # packages for the standard library and fight goimports over grouping.
+      module-path: echpochmak
+      extra:
+        group-params: true
+    goimports:
+      local-prefixes:
+        - echpochmak
+  exclusions:
+    # Generated files (internal/api/gen) carry a "DO NOT EDIT" header.
+    generated: strict
+
+linters:
+  default: standard # errcheck, govet, ineffassign, staticcheck, unused
+  enable:
+    # Bugs and correctness.
+    - asasalint
+    - asciicheck
+    - bidichk
+    - bodyclose
+    - canonicalheader
+    - copyloopvar
+    - durationcheck
+    - errchkjson
+    - errorlint
+    - exhaustive
+    - fatcontext
+    - forcetypeassert
+    - gocheckcompilerdirectives
+    - gosec
+    - loggercheck
+    - makezero
+    - musttag
+    - nilerr
+    - nilnesserr
+    - nilnil
+    - noctx
+    - reassign
+    - recvcheck
+    - rowserrcheck
+    - sqlclosecheck
+    - wrapcheck
+
+    # Complexity.
+    - cyclop
+    - funlen
+    - gocognit
+    - nestif
+
+    # Style and clarity.
+    - errname
+    - exptostd
+    - gochecknoglobals
+    - gochecknoinits
+    - goconst
+    - gocritic
+    - godot
+    - goprintffuncname
+    - intrange
+    - lll
+    - mirror
+    - misspell
+    - nakedret
+    - nolintlint
+    - nosprintfhostport
+    - perfsprint
+    - prealloc
+    - predeclared
+    - revive
+    - sloglint
+    - unconvert
+    - unparam
+    - usestdlibvars
+    - usetesting
+    - wastedassign
+    - whitespace
+
+    # Tests.
+    - paralleltest
+    - testableexamples
+    - thelper
+    - tparallel
+
+  settings:
+    cyclop:
+      max-complexity: 30
+      package-average: 10.0
+
+    errcheck:
+      check-type-assertions: true
+
+    exhaustive:
+      check:
+        - switch
+        - mapliteral
+
+    funlen:
+      # Count statements, not lines: long test tables are fine.
+      lines: -1
+      statements: 50
+      ignore-comments: true
+
+    gocognit:
+      min-complexity: 20
+
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - style
+        - performance
+      disabled-checks:
+        # Store records are passed by value on purpose: they are small and
+        # copying them is what keeps stored state isolated from callers.
+        - hugeParam
+        - unnamedResult
+      settings:
+        captLocal:
+          paramsOnly: false
+
+    govet:
+      enable-all: true
+      disable:
+        # Field order follows readability, not padding.
+        - fieldalignment
+      settings:
+        shadow:
+          strict: false
+
+    lll:
+      line-length: 120
+      tab-width: 4
+
+    nakedret:
+      max-func-lines: 3
+
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+      allow-no-explanation:
+        - funlen
+        - gocognit
+        - lll
+
+    revive:
+      rules:
+        - name: blank-imports
+        - name: context-as-argument
+        - name: context-keys-type
+        - name: dot-imports
+        - name: early-return
+        - name: empty-block
+        - name: error-naming
+        - name: error-return
+        - name: error-strings
+        - name: errorf
+        - name: exported
+        - name: increment-decrement
+        - name: indent-error-flow
+        - name: package-comments
+        - name: range
+        - name: receiver-naming
+        - name: redefines-builtin-id
+        - name: superfluous-else
+        - name: time-naming
+        - name: unexported-return
+        - name: unreachable-code
+        - name: unused-parameter
+        - name: use-any
+        - name: var-declaration
+        - name: var-naming
+
+    sloglint:
+      no-mixed-args: true
+      key-naming-case: snake
+      context: scope
+      forbidden-keys:
+        - time
+        - level
+        - msg
+        - source
+
+    wrapcheck:
+      ignore-package-globs:
+        - echpochmak/*
+
+  exclusions:
+    generated: strict
+    warn-unused: true
+    presets:
+      - std-error-handling
+      - common-false-positives
+    rules:
+      - path: _test\.go
+        linters:
+          - funlen
+          - gochecknoglobals
+          - gocognit
+          - gosec
+          - wrapcheck
+          - cyclop
+      # The contract suite is test code that lives outside _test.go files so
+      # that every store implementation can import it.
+      - path: internal/store/storetest/
+        linters:
+          - funlen
+          - gocognit
+          - goconst
+          - thelper
+      # Build information is injected with -ldflags into package variables.
+      - path: internal/version/
+        linters:
+          - gochecknoglobals

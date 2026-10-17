@@ -1,0 +1,18 @@
+# Personal working notes
+arch/prompt.md
+
+# Build output and tools
+/bin/
+
+# Test output
+coverage.out
+coverage.html
+
+# Local environment
+deployments/compose/.env
+
+# Editors and OS
+.idea/
+.vscode/
+*.swp
+.DS_Store

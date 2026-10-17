@@ -1,0 +1,9 @@
+# Configuration for oapi-codegen, run via `make generate` (go generate ./...).
+# Input is the overlay-patched spec produced by internal/tools/applyoverlay.
+package: gen
+output: api.gen.go
+generate:
+  models: true
+  std-http-server: true
+  strict-server: true
+  embedded-spec: false

@@ -1,0 +1,3 @@
+source: https://raw.githubusercontent.com/apache/iceberg/79bc69a51da6d95ccd6da6d46ef156c74e30b8cf/open-api/rest-catalog-open-api.yaml
+commit: 79bc69a51da6d95ccd6da6d46ef156c74e30b8cf
+downloaded: 2026-10-17
