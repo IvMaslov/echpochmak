@@ -13,6 +13,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -27,12 +29,32 @@ const (
 	StoreMemory = "memory"
 )
 
+// warehouseSchemes returns the URL schemes accepted by -s3-warehouse. file://
+// and mem:// are for local runs without object storage and for tests.
+func warehouseSchemes() []string {
+	return []string{"s3://", "s3a://", "file://", "mem://"}
+}
+
 // Config is the catalog-server configuration.
 type Config struct {
-	HTTP  HTTP
-	Log   logger.Config
-	Store Store
-	S3    S3
+	HTTP    HTTP
+	Log     logger.Config
+	Catalog Catalog
+	Store   Store
+	S3      S3
+}
+
+// Catalog configures the Iceberg catalog behaviour.
+type Catalog struct {
+	// Name is the catalog prefix returned by /v1/config; clients put it in
+	// every request path.
+	Name string
+	// CommitRetries is how many times a commit is retried on the server after
+	// a concurrent change, as long as its requirements still hold.
+	CommitRetries int
+	// MetadataCacheSize is the number of metadata files kept in memory; zero
+	// disables the cache.
+	MetadataCacheSize int
 }
 
 // HTTP configures the HTTP server.
@@ -45,6 +67,8 @@ type HTTP struct {
 	// ShutdownTimeout bounds how long in-flight requests may take to finish
 	// after a shutdown signal.
 	ShutdownTimeout time.Duration
+	// MaxBodyBytes limits the size of request bodies.
+	MaxBodyBytes int64
 }
 
 // Store selects and configures the store backend.
@@ -60,6 +84,25 @@ type S3 struct {
 	AccessKeyID     string
 	SecretAccessKey Secret
 	PathStyle       bool
+}
+
+// IOProps returns the iceberg-go file IO properties for this configuration.
+func (s S3) IOProps() map[string]string {
+	props := map[string]string{
+		"s3.region":                   s.Region,
+		"s3.force-virtual-addressing": strconv.FormatBool(!s.PathStyle),
+	}
+
+	if s.Endpoint != "" {
+		props["s3.endpoint"] = s.Endpoint
+	}
+
+	if s.AccessKeyID != "" {
+		props["s3.access-key-id"] = s.AccessKeyID
+		props["s3.secret-access-key"] = string(s.SecretAccessKey)
+	}
+
+	return props
 }
 
 // Secret is a string that is never printed or logged.
@@ -132,16 +175,31 @@ func register(fs *flag.FlagSet, cfg *Config) {
 	fs.DurationVar(&cfg.HTTP.WriteTimeout, "http-write-timeout", 60*time.Second, "time to write a response")
 	fs.DurationVar(&cfg.HTTP.IdleTimeout, "http-idle-timeout", 120*time.Second, "keep-alive idle timeout")
 	fs.DurationVar(&cfg.HTTP.ShutdownTimeout, "http-shutdown-timeout", 20*time.Second, "graceful shutdown timeout")
+	fs.Int64Var(&cfg.HTTP.MaxBodyBytes, "http-max-body-bytes", 16<<20, "maximum request body size in bytes")
 
 	fs.TextVar(&cfg.Log.Level, "log-level", slog.LevelInfo, "log level: debug, info, warn, error")
 	fs.TextVar(&cfg.Log.Format, "log-format", logger.FormatJSON, "log format: json, text")
 	fs.BoolVar(&cfg.Log.AddSource, "log-add-source", false, "add source file and line to log records")
 
+	fs.StringVar(&cfg.Catalog.Name, "catalog-name", "main", "catalog name, used as the URL prefix by clients")
+	fs.IntVar(&cfg.Catalog.CommitRetries, "commit-retries", 4, "server-side retries of a conflicting commit")
+	fs.IntVar(
+		&cfg.Catalog.MetadataCacheSize,
+		"metadata-cache-size",
+		1000,
+		"metadata files cached in memory; 0 disables",
+	)
+
 	fs.StringVar(&cfg.Store.Backend, "store-backend", StoreMemory, "store backend: memory")
 
 	fs.StringVar(&cfg.S3.Endpoint, "s3-endpoint", "", "S3 endpoint URL; empty for AWS")
 	fs.StringVar(&cfg.S3.Region, "s3-region", "us-east-1", "S3 region")
-	fs.StringVar(&cfg.S3.Warehouse, "s3-warehouse", "s3://warehouse/", "warehouse location for new tables")
+	fs.StringVar(
+		&cfg.S3.Warehouse,
+		"s3-warehouse",
+		"s3://warehouse/",
+		"warehouse location for new tables: s3://, s3a://, file:// or mem:// URL",
+	)
 	fs.StringVar(&cfg.S3.AccessKeyID, "s3-access-key-id", "", "S3 access key ID")
 	fs.Func("s3-secret-access-key", "S3 secret access key", func(v string) error {
 		cfg.S3.SecretAccessKey = Secret(v)
@@ -205,12 +263,25 @@ func (cfg Config) Validate() error {
 		}
 	}
 
+	if cfg.HTTP.MaxBodyBytes <= 0 {
+		errs = append(errs, fmt.Errorf("http-max-body-bytes must be positive, got %d", cfg.HTTP.MaxBodyBytes))
+	}
+
+	errs = append(errs, cfg.Catalog.validate()...)
+
 	if cfg.Store.Backend != StoreMemory {
 		errs = append(errs, fmt.Errorf("store-backend %q is not supported, want %q", cfg.Store.Backend, StoreMemory))
 	}
 
-	if !strings.HasPrefix(cfg.S3.Warehouse, "s3://") {
-		errs = append(errs, fmt.Errorf("s3-warehouse %q must be an s3:// URL", cfg.S3.Warehouse))
+	schemes := warehouseSchemes()
+	if !slices.ContainsFunc(schemes, func(scheme string) bool {
+		return strings.HasPrefix(cfg.S3.Warehouse, scheme)
+	}) {
+		errs = append(errs, fmt.Errorf(
+			"s3-warehouse %q must start with one of %s",
+			cfg.S3.Warehouse,
+			strings.Join(schemes, ", "),
+		))
 	}
 
 	if (cfg.S3.AccessKeyID == "") != (cfg.S3.SecretAccessKey == "") {
@@ -224,6 +295,24 @@ func (cfg Config) Validate() error {
 	return nil
 }
 
+func (c Catalog) validate() []error {
+	var errs []error
+
+	if c.Name == "" || strings.ContainsAny(c.Name, "/?#%") {
+		errs = append(errs, fmt.Errorf("catalog-name %q must be non-empty and URL path safe", c.Name))
+	}
+
+	if c.CommitRetries < 0 {
+		errs = append(errs, fmt.Errorf("commit-retries must not be negative, got %d", c.CommitRetries))
+	}
+
+	if c.MetadataCacheSize < 0 {
+		errs = append(errs, fmt.Errorf("metadata-cache-size must not be negative, got %d", c.MetadataCacheSize))
+	}
+
+	return errs
+}
+
 // LogValue implements [slog.LogValuer]. Secrets are redacted.
 func (cfg Config) LogValue() slog.Value {
 	return slog.GroupValue(
@@ -234,6 +323,12 @@ func (cfg Config) LogValue() slog.Value {
 			slog.Duration("write_timeout", cfg.HTTP.WriteTimeout),
 			slog.Duration("idle_timeout", cfg.HTTP.IdleTimeout),
 			slog.Duration("shutdown_timeout", cfg.HTTP.ShutdownTimeout),
+			slog.Int64("max_body_bytes", cfg.HTTP.MaxBodyBytes),
+		),
+		slog.Group("catalog",
+			slog.String("name", cfg.Catalog.Name),
+			slog.Int("commit_retries", cfg.Catalog.CommitRetries),
+			slog.Int("metadata_cache_size", cfg.Catalog.MetadataCacheSize),
 		),
 		slog.Group("log",
 			slog.String("min_level", cfg.Log.Level.String()),

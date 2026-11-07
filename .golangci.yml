@@ -9,6 +9,9 @@ version: "2"
 
 run:
   timeout: 5m
+  # Lint the end-to-end tests too.
+  build-tags:
+    - e2e
   modules-download-mode: readonly
 
 issues:
@@ -146,9 +149,9 @@ linters:
       disable:
         # Field order follows readability, not padding.
         - fieldalignment
-      settings:
-        shadow:
-          strict: false
+        # Conflicts with the scoped `if err := ...; err != nil` idiom that the
+        # style guide prefers whenever an outer err exists.
+        - shadow
 
     lll:
       line-length: 120
@@ -216,6 +219,7 @@ linters:
     rules:
       - path: _test\.go
         linters:
+          - goconst
           - funlen
           - gochecknoglobals
           - gocognit
@@ -230,6 +234,11 @@ linters:
           - gocognit
           - goconst
           - thelper
+      # The end-to-end scenario is a sequence of steps on shared state.
+      - path: test/e2e/
+        linters:
+          - paralleltest
+          - tparallel
       # Build information is injected with -ldflags into package variables.
       - path: internal/version/
         linters:

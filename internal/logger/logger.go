@@ -35,6 +35,10 @@ const (
 	KeyNamespace = "namespace"
 	KeyTable     = "table"
 	KeyView      = "view"
+	KeyLocation  = "location"
+	KeyVersion   = "version"
+	KeyAttempt   = "attempt"
+	KeyReason    = "reason"
 )
 
 // Format selects the output encoding.
@@ -112,9 +116,15 @@ func WithContext(ctx context.Context, l *slog.Logger) context.Context {
 // FromContext returns the logger carried by ctx, or [slog.Default] if there is
 // none. HTTP handlers get a logger tagged with the request ID this way.
 func FromContext(ctx context.Context) *slog.Logger {
+	return FromContextOr(ctx, slog.Default())
+}
+
+// FromContextOr returns the logger carried by ctx, or fallback if there is
+// none.
+func FromContextOr(ctx context.Context, fallback *slog.Logger) *slog.Logger {
 	if l, ok := ctx.Value(ctxKey{}).(*slog.Logger); ok {
 		return l
 	}
 
-	return slog.Default()
+	return fallback
 }

@@ -99,6 +99,11 @@ test: ## Run all tests with the race detector
 test-short: ## Run fast unit tests only
 	go test -short -count=1 ./...
 
+.PHONY: e2e
+e2e: deployments/compose/.env ## Start the compose stack and run the Trino end-to-end tests
+	$(COMPOSE) up -d --build --wait
+	go test -tags e2e -count=1 -v ./test/e2e/
+
 .PHONY: cover
 cover: ## Run tests with coverage and write an HTML report
 	go test -race -count=1 -covermode=atomic -coverprofile=$(COVER_PROFILE) ./...

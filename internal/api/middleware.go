@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -33,15 +34,16 @@ func withRequestLogging(base *slog.Logger, next http.Handler) http.Handler {
 		w.Header().Set(HeaderRequestID, id)
 
 		log := base.With(slog.String(logger.KeyRequestID, id))
-		r = r.WithContext(logger.WithContext(r.Context(), log))
+		route := &routeHolder{}
+		ctx := context.WithValue(logger.WithContext(r.Context(), log), routeKey{}, route)
+		r = r.WithContext(ctx)
 		rec := &responseRecorder{ResponseWriter: w, status: http.StatusOK}
 
 		next.ServeHTTP(rec, r)
 
-		// The mux sets r.Pattern on the request it routed, which is r.
-		route := r.Pattern
-		if route == "" {
-			route = "unmatched"
+		pattern := route.pattern
+		if pattern == "" {
+			pattern = "unmatched"
 		}
 
 		level := slog.LevelInfo
@@ -51,13 +53,34 @@ func withRequestLogging(base *slog.Logger, next http.Handler) http.Handler {
 
 		log.LogAttrs(r.Context(), level, "http request",
 			slog.String(logger.KeyMethod, r.Method),
-			slog.String(logger.KeyRoute, route),
+			slog.String(logger.KeyRoute, pattern),
 			slog.String(logger.KeyPath, r.URL.Path),
 			slog.Int(logger.KeyStatus, rec.status),
 			slog.Duration(logger.KeyDuration, time.Since(start)),
 			slog.Int64(logger.KeyBytes, rec.bytes),
 			slog.String(logger.KeyRemote, r.RemoteAddr),
 		)
+	})
+}
+
+type routeKey struct{}
+
+// routeHolder carries the matched route pattern back to the logging
+// middleware. Middleware between the two may replace the request, so the
+// pattern the mux sets on its request is not visible to the logger directly.
+type routeHolder struct {
+	pattern string
+}
+
+// withRoute records the route pattern that mux matched. It must wrap the mux
+// directly.
+func withRoute(mux http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mux.ServeHTTP(w, r)
+
+		if route, ok := r.Context().Value(routeKey{}).(*routeHolder); ok {
+			route.pattern = r.Pattern
+		}
 	})
 }
 

@@ -74,6 +74,10 @@ func TestLoadErrors(t *testing.T) {
 		{name: "non-positive timeout", args: []string{"-http-idle-timeout", "0s"}, want: "http-idle-timeout"},
 		{name: "unsupported backend", args: []string{"-store-backend", "raft"}, want: "store-backend"},
 		{name: "bad warehouse", args: []string{"-s3-warehouse", "/tmp/w"}, want: "s3-warehouse"},
+		{name: "bad catalog name", args: []string{"-catalog-name", "a/b"}, want: "catalog-name"},
+		{name: "negative retries", args: []string{"-commit-retries", "-1"}, want: "commit-retries"},
+		{name: "negative cache size", args: []string{"-metadata-cache-size", "-1"}, want: "metadata-cache-size"},
+		{name: "zero body limit", args: []string{"-http-max-body-bytes", "0"}, want: "http-max-body-bytes"},
 		{name: "half credentials", args: []string{"-s3-access-key-id", "key"}, want: "set together"},
 	}
 
@@ -121,6 +125,45 @@ func TestSecretIsRedacted(t *testing.T) {
 	for _, out := range []string{buf.String(), printed} {
 		if strings.Contains(out, "hunter2") {
 			t.Fatalf("secret leaked: %s", out)
+		}
+	}
+}
+
+func TestWarehouseSchemes(t *testing.T) {
+	t.Parallel()
+
+	for _, w := range []string{"s3://w/", "s3a://w/", "file:///tmp/w", "mem://w/"} {
+		if _, err := config.Load([]string{"-s3-warehouse", w}, env(nil)); err != nil {
+			t.Errorf("warehouse %q rejected: %v", w, err)
+		}
+	}
+}
+
+func TestS3IOProps(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := config.Load([]string{
+		"-s3-endpoint", "http://minio:9000",
+		"-s3-path-style",
+		"-s3-access-key-id", "key",
+		"-s3-secret-access-key", "secret",
+	}, env(nil))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	props := cfg.S3.IOProps()
+	want := map[string]string{
+		"s3.endpoint":                 "http://minio:9000",
+		"s3.region":                   "us-east-1",
+		"s3.force-virtual-addressing": "false",
+		"s3.access-key-id":            "key",
+		"s3.secret-access-key":        "secret",
+	}
+
+	for k, v := range want {
+		if props[k] != v {
+			t.Errorf("IOProps()[%q] = %q, want %q", k, props[k], v)
 		}
 	}
 }

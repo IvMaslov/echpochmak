@@ -93,8 +93,8 @@ Phases 1 and 2 are independent and can run in parallel.
 - Write a `docker-compose` with MinIO and Trino.
 - Define the `Store` interface, its errors and the contract test suite, and implement `memstore`.
 
-### Phase 1: Catalog server on memstore
-- Endpoints: `GET /v1/config`, namespace CRUD, table create/load/list/drop/rename/exists, and `POST .../tables/{t}` commit.
+### Phase 1: Catalog server on memstore (done, 2026-10-19)
+- Endpoints: `GET /v1/config`, namespace CRUD, table create (including staged create, moved here from Phase 4 on the assumption that Trino needs it; e2e showed Trino 484 creates tables directly, but staged create stays for other clients)/load/list/drop/rename/exists, `POST .../tables/{t}` commit, and metrics reporting.
 - Commit flow: load current metadata → check requirements → apply updates → write the new metadata file to S3 → CAS the pointer. On a CAS conflict, return `409 CommitFailedException`.
 - Map errors to the spec's `ErrorModel` and status codes.
 - No auth: the server doesn't advertise the OAuth endpoints.
@@ -118,7 +118,7 @@ Phases 1 and 2 are independent and can run in parallel.
 - **Milestone:** Spark + PyIceberg end-to-end tests pass against MinIO + 3 kv-nodes + 2 servers. Killing a server replica or the raft leader mid-test causes no errors beyond retries.
 
 ### Phase 4: Full spec coverage
-- Views, `transactions/commit` (multi-table atomic), metrics reporting (accept and log), `register` table, staged create (create-transaction), purge on drop.
+- Views, `transactions/commit` (multi-table atomic), `register` table, purge on drop. (Staged create and metrics reporting were done in Phase 1.)
 - Run Iceberg's REST compatibility tests (Java `RESTCatalog` test kit / `iceberg-rest-fixture`) against the server.
 
 ### Phase 5: Disaster resistance and operations

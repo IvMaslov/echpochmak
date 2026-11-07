@@ -8,7 +8,6 @@ import (
 
 	"echpochmak/internal/api/gen"
 	"echpochmak/internal/logger"
-	"echpochmak/internal/store"
 )
 
 // Operational endpoints, outside the Iceberg API.
@@ -19,11 +18,23 @@ const (
 
 const readyTimeout = 2 * time.Second
 
+// DefaultMaxBodyBytes is the request body limit when Options.MaxBodyBytes is
+// not set.
+const DefaultMaxBodyBytes = 16 << 20
+
+// Pinger reports whether a dependency can serve requests.
+type Pinger interface {
+	Ping(ctx context.Context) error
+}
+
 // Options configures [NewHandler].
 type Options struct {
 	Logger *slog.Logger
-	Store  store.Store
+	// Ready is checked by the readiness probe.
+	Ready  Pinger
 	Server *Server
+	// MaxBodyBytes limits request bodies; zero means DefaultMaxBodyBytes.
+	MaxBodyBytes int64
 }
 
 // NewHandler returns the HTTP handler of the catalog server: the Iceberg REST
@@ -32,7 +43,7 @@ func NewHandler(opts Options) http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET "+pathHealthz, handleHealthz)
-	mux.HandleFunc("GET "+pathReadyz, readyzHandler(opts.Store))
+	mux.HandleFunc("GET "+pathReadyz, readyzHandler(opts.Ready))
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeErrorModel(w, r, http.StatusNotFound, typeNotFound, "no route for "+r.Method+" "+r.URL.Path)
 	})
@@ -46,7 +57,12 @@ func NewHandler(opts Options) http.Handler {
 		ErrorHandlerFunc: writeBadRequest,
 	})
 
-	return withRequestLogging(opts.Logger, withRecovery(mux))
+	maxBody := opts.MaxBodyBytes
+	if maxBody <= 0 {
+		maxBody = DefaultMaxBodyBytes
+	}
+
+	return withRequestLogging(opts.Logger, withRecovery(withRawBody(maxBody, withRoute(mux))))
 }
 
 // probeResponse is the body of the health and readiness probes.
@@ -58,7 +74,7 @@ func handleHealthz(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, r, http.StatusOK, probeResponse{Status: "ok"})
 }
 
-func readyzHandler(s store.Store) http.HandlerFunc {
+func readyzHandler(s Pinger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), readyTimeout)
 		defer cancel()

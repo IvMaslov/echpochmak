@@ -1,0 +1,60 @@
+{
+  "identifier": {"namespace": ["db"], "name": "t"},
+  "requirements": [
+    {"type": "assert-create"},
+    {"type": "assert-table-uuid", "uuid": "2cc52516-5e73-41f2-b139-545d41a4e151"},
+    {"type": "assert-ref-snapshot-id", "ref": "main", "snapshot-id": 3055729675574597004},
+    {"type": "assert-ref-snapshot-id", "ref": "branch", "snapshot-id": null},
+    {"type": "assert-last-assigned-field-id", "last-assigned-field-id": 3},
+    {"type": "assert-current-schema-id", "current-schema-id": 1},
+    {"type": "assert-last-assigned-partition-id", "last-assigned-partition-id": 1000},
+    {"type": "assert-default-spec-id", "default-spec-id": 0},
+    {"type": "assert-default-sort-order-id", "default-sort-order-id": 1}
+  ],
+  "updates": [
+    {"action": "assign-uuid", "uuid": "2cc52516-5e73-41f2-b139-545d41a4e151"},
+    {"action": "upgrade-format-version", "format-version": 2},
+    {"action": "add-schema", "last-column-id": 4, "schema": {"type": "struct", "schema-id": 1,
+      "identifier-field-ids": [1],
+      "fields": [
+        {"id": 1, "name": "id", "required": true, "type": "long", "doc": "primary key"},
+        {"id": 2, "name": "tags", "required": false, "type": {"type": "list", "element-id": 3, "element": "string", "element-required": false}},
+        {"id": 4, "name": "attrs", "required": false, "type": {"type": "map", "key-id": 5, "key": "string", "value-id": 6, "value": "decimal(10, 2)", "value-required": true}},
+        {"id": 7, "name": "point", "required": false, "type": {"type": "struct", "fields": [
+          {"id": 8, "name": "x", "required": true, "type": "double"},
+          {"id": 9, "name": "ts", "required": false, "type": "timestamptz"}]}}]}},
+    {"action": "set-current-schema", "schema-id": -1},
+    {"action": "add-spec", "spec": {"spec-id": 1, "fields": [
+      {"name": "id_bucket", "transform": "bucket[16]", "source-id": 1, "field-id": 1000},
+      {"name": "ts_day", "transform": "day", "source-id": 9, "field-id": 1001},
+      {"name": "id_trunc", "transform": "truncate[4]", "source-id": 1, "field-id": 1002}]}},
+    {"action": "set-default-spec", "spec-id": -1},
+    {"action": "add-sort-order", "sort-order": {"order-id": 1, "fields": [
+      {"transform": "identity", "source-id": 1, "direction": "desc", "null-order": "nulls-last"}]}},
+    {"action": "set-default-sort-order", "sort-order-id": -1},
+    {"action": "add-snapshot", "snapshot": {
+      "snapshot-id": 3055729675574597004, "sequence-number": 1, "timestamp-ms": 1555100955770,
+      "manifest-list": "s3://b/t/metadata/snap-3055729675574597004-1.avro",
+      "summary": {"operation": "append", "added-data-files": "1"}, "schema-id": 1}},
+    {"action": "set-snapshot-ref", "ref-name": "main", "type": "branch", "snapshot-id": 3055729675574597004,
+      "max-ref-age-ms": 1000, "max-snapshot-age-ms": 2000, "min-snapshots-to-keep": 3},
+    {"action": "remove-snapshots", "snapshot-ids": [1, 2]},
+    {"action": "remove-snapshot-ref", "ref-name": "old"},
+    {"action": "set-location", "location": "s3://b/t"},
+    {"action": "set-properties", "updates": {"k": "v"}},
+    {"action": "remove-properties", "removals": ["gone"]},
+    {"action": "set-statistics", "statistics": {"snapshot-id": 3055729675574597004,
+      "statistics-path": "s3://b/t/stats.puffin", "file-size-in-bytes": 100, "file-footer-size-in-bytes": 10,
+      "blob-metadata": [{"type": "apache-datasketches-theta-v1", "snapshot-id": 3055729675574597004,
+        "sequence-number": 1, "fields": [1], "properties": {"ndv": "5"}}]}},
+    {"action": "remove-statistics", "snapshot-id": 3055729675574597004},
+    {"action": "set-partition-statistics", "partition-statistics": {"snapshot-id": 3055729675574597004,
+      "statistics-path": "s3://b/t/partition-stats.parquet", "file-size-in-bytes": 200}},
+    {"action": "remove-partition-statistics", "snapshot-id": 3055729675574597004},
+    {"action": "remove-partition-specs", "spec-ids": [0]},
+    {"action": "remove-schemas", "schema-ids": [0]},
+    {"action": "add-encryption-key", "encryption-key": {"key-id": "k1", "encrypted-key-metadata": "AAEC",
+      "encrypted-by-id": "kms"}},
+    {"action": "remove-encryption-key", "key-id": "k1"}
+  ]
+}

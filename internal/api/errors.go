@@ -7,12 +7,17 @@ import (
 	"net/http"
 
 	"echpochmak/internal/api/gen"
+	"echpochmak/internal/catalog"
 	"echpochmak/internal/logger"
 	"echpochmak/internal/store"
 )
 
-// errNotImplemented is returned by operations that are not implemented yet.
-var errNotImplemented = errors.New("operation not implemented")
+var (
+	// errNotImplemented is returned by operations that are not implemented yet.
+	errNotImplemented = errors.New("operation not implemented")
+	// errNotFound is returned for requests to an unknown catalog prefix.
+	errNotFound = errors.New("not found")
+)
 
 // Iceberg error types, as named by the REST spec and expected by clients.
 const (
@@ -23,6 +28,8 @@ const (
 	typeAlreadyExists       = "AlreadyExistsException"
 	typeNamespaceNotEmpty   = "NamespaceNotEmptyException"
 	typeCommitFailed        = "CommitFailedException"
+	typeCommitStateUnknown  = "CommitStateUnknownException"
+	typeUnprocessable       = "UnprocessableEntityException"
 	typeUnsupported         = "UnsupportedOperationException"
 	typeServiceUnavailable  = "ServiceUnavailableException"
 	typeInternalServerError = "InternalServerError"
@@ -48,8 +55,16 @@ func classify(err error) (status int, errType string, ok bool) {
 	switch {
 	case errors.Is(err, errNotImplemented):
 		return http.StatusNotImplemented, typeUnsupported, true
-	case errors.Is(err, store.ErrInvalidArgument):
+	case errors.Is(err, errNotFound):
+		return http.StatusNotFound, typeNotFound, true
+	case errors.Is(err, store.ErrInvalidArgument), errors.Is(err, catalog.ErrInvalidRequest):
 		return http.StatusBadRequest, typeBadRequest, true
+	case errors.Is(err, catalog.ErrPropertyConflict):
+		return http.StatusUnprocessableEntity, typeUnprocessable, true
+	case errors.Is(err, catalog.ErrRequirementFailed):
+		return http.StatusConflict, typeCommitFailed, true
+	case errors.Is(err, catalog.ErrCommitStateUnknown):
+		return http.StatusServiceUnavailable, typeCommitStateUnknown, true
 	case errors.Is(err, store.ErrNamespaceNotFound):
 		return http.StatusNotFound, typeNoSuchNamespace, true
 	case errors.Is(err, store.ErrTableNotFound):

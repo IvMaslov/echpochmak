@@ -13,19 +13,33 @@ import (
 
 	"echpochmak/internal/api"
 	"echpochmak/internal/api/gen"
+	"echpochmak/internal/catalog"
+	"echpochmak/internal/fileio"
 	"echpochmak/internal/store"
 	"echpochmak/internal/store/memstore"
 )
 
+// newTestHandler returns the full handler on top of s, with metadata files in
+// an in-memory warehouse private to the test.
 func newTestHandler(t *testing.T, s store.Store) (http.Handler, *bytes.Buffer) {
 	t.Helper()
 
 	var logs bytes.Buffer
 
+	log := slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	svc := catalog.New(catalog.Options{
+		Store:         s,
+		Files:         fileio.NewIceberg(context.Background(), nil),
+		Warehouse:     "mem://api-test/" + t.Name(),
+		CommitRetries: catalog.DefaultCommitRetries,
+		Logger:        log,
+	})
+
 	h := api.NewHandler(api.Options{
-		Logger: slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
-		Store:  s,
-		Server: api.NewServer(),
+		Logger:       log,
+		Ready:        svc,
+		Server:       api.NewServer(svc, "main"),
+		MaxBodyBytes: 1 << 20,
 	})
 
 	return h, &logs
@@ -62,11 +76,15 @@ func TestUnimplementedOperations(t *testing.T) {
 	tests := []struct {
 		method, target, body string
 	}{
-		{method: http.MethodGet, target: "/v1/config"},
-		{method: http.MethodGet, target: "/v1/main/namespaces"},
-		{method: http.MethodPost, target: "/v1/main/namespaces", body: `{"namespace":["db"]}`},
-		{method: http.MethodGet, target: "/v1/main/namespaces/db%1Fsub/tables/t"},
+		{method: http.MethodGet, target: "/v1/main/namespaces/db/views"},
+		{method: http.MethodGet, target: "/v1/main/namespaces/db/views/v"},
 		{method: http.MethodPost, target: "/v1/main/transactions/commit", body: `{"table-changes":[]}`},
+		{
+			method: http.MethodPost,
+			target: "/v1/main/namespaces/db/register",
+			body:   `{"name":"t","metadata-location":"x"}`,
+		},
+		{method: http.MethodPost, target: "/v1/oauth/tokens", body: ``},
 	}
 
 	for _, tt := range tests {
@@ -168,8 +186,17 @@ func TestRequestID(t *testing.T) {
 		t.Fatalf("access log is not one JSON line: %v\n%s", err, logs.String())
 	}
 
-	if line["request_id"] != "trace-123" || line["route"] != "GET /v1/config" || line["status"] != float64(501) {
+	if line["request_id"] != "trace-123" || line["route"] != "GET /v1/config" || line["status"] != float64(200) {
 		t.Fatalf("access log = %v", line)
+	}
+
+	// Requests with a body go through more middleware; the route must still
+	// be logged.
+	logs.Reset()
+	serve(h, http.MethodPost, "/v1/main/namespaces", `{"namespace":["routed"]}`)
+
+	if !strings.Contains(logs.String(), `"route":"POST /v1/{prefix}/namespaces"`) {
+		t.Fatalf("POST access log has no route: %s", logs.String())
 	}
 
 	generated := serve(h, http.MethodGet, "/healthz", "").Header().Get(api.HeaderRequestID)

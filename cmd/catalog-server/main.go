@@ -17,8 +17,13 @@ import (
 	"os/signal"
 	"syscall"
 
+	// Registers the s3:// scheme with iceberg-go's file IO.
+	_ "github.com/apache/iceberg-go/io/gocloud/s3"
+
 	"echpochmak/internal/api"
+	"echpochmak/internal/catalog"
 	"echpochmak/internal/config"
+	"echpochmak/internal/fileio"
 	"echpochmak/internal/logger"
 	"echpochmak/internal/store"
 	"echpochmak/internal/store/memstore"
@@ -62,12 +67,25 @@ func run() error {
 		return err
 	}
 
+	// Storage clients must keep working while in-flight requests drain after
+	// a shutdown signal cancels ctx.
+	storageCtx := context.WithoutCancel(ctx)
+	files := fileio.NewCached(fileio.NewIceberg(storageCtx, cfg.S3.IOProps()), cfg.Catalog.MetadataCacheSize)
+	svc := catalog.New(catalog.Options{
+		Store:         st,
+		Files:         files,
+		Warehouse:     cfg.S3.Warehouse,
+		CommitRetries: cfg.Catalog.CommitRetries,
+		Logger:        log,
+	})
+
 	srv := &http.Server{
 		Addr: cfg.HTTP.Addr,
 		Handler: api.NewHandler(api.Options{
-			Logger: log,
-			Store:  st,
-			Server: api.NewServer(),
+			Logger:       log,
+			Ready:        svc,
+			Server:       api.NewServer(svc, cfg.Catalog.Name),
+			MaxBodyBytes: cfg.HTTP.MaxBodyBytes,
 		}),
 		ReadHeaderTimeout: cfg.HTTP.ReadHeaderTimeout,
 		ReadTimeout:       cfg.HTTP.ReadTimeout,
