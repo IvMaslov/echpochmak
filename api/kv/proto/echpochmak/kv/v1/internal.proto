@@ -1,0 +1,57 @@
+syntax = "proto3";
+
+package echpochmak.kv.v1;
+
+option go_package = "echpochmak/internal/kv/kvpb;kvpb";
+
+import "echpochmak/kv/v1/cluster.proto";
+import "echpochmak/kv/v1/kv.proto";
+
+// Messages in this file are stored and replicated, never sent to clients.
+
+// Proposal is the payload of a raft log entry: one write.
+message Proposal {
+  bytes request_id = 1;
+
+  oneof operation {
+    PutRequest put = 2;
+    DeleteRangeRequest delete_range = 3;
+    TxnRequest txn = 4;
+  }
+}
+
+// Result is the outcome of an applied Proposal.
+message Result {
+  oneof result {
+    PutResponse put = 1;
+    DeleteRangeResponse delete_range = 2;
+    TxnResponse txn = 3;
+  }
+  // Set instead of a result when the proposal was invalid. Validation runs
+  // again at apply time, so every node reaches the same verdict.
+  string error = 4;
+}
+
+// DedupRecord remembers the result of a write by its request ID.
+message DedupRecord {
+  int64 revision = 1;
+  Result result = 2;
+}
+
+// AppliedState is the state machine's metadata, stored with the data so that
+// a snapshot always carries metadata that matches it.
+message AppliedState {
+  uint64 index = 1;
+  uint64 term = 2;
+  int64 revision = 3;
+  // raftpb.ConfState in protobuf encoding.
+  bytes conf_state = 4;
+  repeated Member members = 5;
+}
+
+// ConfChangeContext is the context of a raft conf change.
+message ConfChangeContext {
+  // Identifies the change, so the proposing node can wait for it.
+  bytes request_id = 1;
+  Member member = 2;
+}

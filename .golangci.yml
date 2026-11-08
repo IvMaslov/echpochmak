@@ -12,6 +12,7 @@ run:
   # Lint the end-to-end tests too.
   build-tags:
     - e2e
+    - kvchaos
   modules-download-mode: readonly
 
 issues:
@@ -120,6 +121,9 @@ linters:
       check:
         - switch
         - mapliteral
+      # A default case handles the rest on purpose; switches over large
+      # foreign enums such as gRPC codes stay readable.
+      default-signifies-exhaustive: true
 
     funlen:
       # Count statements, not lines: long test tables are fine.
@@ -209,6 +213,22 @@ linters:
     wrapcheck:
       ignore-package-globs:
         - echpochmak/*
+        # gRPC handlers must return status errors as they are, or clients
+        # lose the status code.
+        - google.golang.org/grpc/status
+        - google.golang.org/grpc/internal/status
+      # The defaults, plus gRPC stream methods whose errors are statuses.
+      ignore-sigs:
+        - .Errorf(
+        - errors.New(
+        - errors.Unwrap(
+        - errors.Join(
+        - .Wrap(
+        - .Wrapf(
+        - .WithMessage(
+        - .WithMessagef(
+        - .WithStack(
+        - .SendAndClose(
 
   exclusions:
     generated: strict
@@ -235,7 +255,7 @@ linters:
           - goconst
           - thelper
       # The end-to-end scenario is a sequence of steps on shared state.
-      - path: test/e2e/
+      - path: test/(e2e|kvchaos)/
         linters:
           - paralleltest
           - tparallel

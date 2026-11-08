@@ -1,0 +1,109 @@
+syntax = "proto3";
+
+package echpochmak.kv.v1;
+
+option go_package = "echpochmak/internal/kv/kvpb;kvpb";
+
+import "echpochmak/kv/v1/kv.proto";
+
+// ClusterService manages membership and reports node status. Membership
+// changes must be sent to the leader; other nodes answer FAILED_PRECONDITION
+// with the leader's ID.
+service ClusterService {
+  rpc MemberList(MemberListRequest) returns (MemberListResponse);
+  // MemberAdd adds a node as a learner, which replicates but does not vote.
+  rpc MemberAdd(MemberAddRequest) returns (MemberAddResponse);
+  // MemberPromote makes a learner a voter once it has caught up.
+  rpc MemberPromote(MemberPromoteRequest) returns (MemberPromoteResponse);
+  rpc MemberRemove(MemberRemoveRequest) returns (MemberRemoveResponse);
+  // LeaderTransfer hands leadership to another voter.
+  rpc LeaderTransfer(LeaderTransferRequest) returns (LeaderTransferResponse);
+  rpc Status(StatusRequest) returns (StatusResponse);
+}
+
+// Member is a node of the cluster.
+message Member {
+  uint64 id = 1;
+  // Address other nodes reach this node's peer service at.
+  string peer_url = 2;
+  bool learner = 3;
+}
+
+message MemberListRequest {}
+
+message MemberListResponse {
+  ResponseHeader header = 1;
+  string cluster_id = 2;
+  repeated Member members = 3;
+}
+
+message MemberAddRequest {
+  uint64 id = 1;
+  string peer_url = 2;
+}
+
+message MemberAddResponse {
+  ResponseHeader header = 1;
+  repeated Member members = 2;
+}
+
+message MemberPromoteRequest {
+  uint64 id = 1;
+}
+
+message MemberPromoteResponse {
+  ResponseHeader header = 1;
+  repeated Member members = 2;
+}
+
+message MemberRemoveRequest {
+  uint64 id = 1;
+}
+
+message MemberRemoveResponse {
+  ResponseHeader header = 1;
+  repeated Member members = 2;
+}
+
+message LeaderTransferRequest {
+  // Target voter; 0 picks the most up-to-date follower.
+  uint64 target_id = 1;
+}
+
+message LeaderTransferResponse {
+  ResponseHeader header = 1;
+  uint64 leader_id = 2;
+}
+
+message StatusRequest {}
+
+// FollowerProgress is the replication state of a follower, as seen by the
+// leader.
+message FollowerProgress {
+  uint64 id = 1;
+  uint64 match = 2;
+  string state = 3;
+  bool learner = 4;
+}
+
+message StatusResponse {
+  ResponseHeader header = 1;
+  string cluster_id = 2;
+  uint64 leader_id = 3;
+  // Raft role: StateFollower, StateCandidate, StateLeader, StatePreCandidate.
+  string raft_state = 4;
+  uint64 commit_index = 5;
+  uint64 applied_index = 6;
+  // Followers, when this node is the leader.
+  repeated FollowerProgress followers = 7;
+}
+
+// ErrorDetail is attached to error statuses. Clients use it to tell a write
+// that certainly did not happen from one whose outcome is unknown.
+message ErrorDetail {
+  // The write may or may not have been applied; retry with the same request
+  // ID to find out.
+  bool outcome_unknown = 1;
+  // Current leader, if known; set when a request must go to the leader.
+  uint64 leader_id = 2;
+}

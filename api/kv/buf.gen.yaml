@@ -1,0 +1,10 @@
+# Code generation for the KV cluster protocol. Run via `make generate`
+# (go generate ./internal/kv/kvpb), from the api/kv directory.
+version: v2
+plugins:
+  - local: ["go", "tool", "protoc-gen-go"]
+    out: ../../internal/kv/kvpb
+    opt: module=echpochmak/internal/kv/kvpb
+  - local: ["go", "tool", "protoc-gen-go-grpc"]
+    out: ../../internal/kv/kvpb
+    opt: module=echpochmak/internal/kv/kvpb

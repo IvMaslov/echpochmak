@@ -87,6 +87,46 @@ services:
     volumes:
       - ./trino/catalog/iceberg.properties:/etc/trino/catalog/iceberg.properties:ro
 
+  # A 3-node KV cluster, under the "kv" profile: start it with
+  # `docker compose --profile kv up`. The catalog does not use it until
+  # Phase 3. Client ports on the host: 23791-23793.
+  kv1: &kv-node
+    profiles: ["kv"]
+    build:
+      context: ../..
+      dockerfile: build/kv-node/Dockerfile
+      network: ${BUILD_NETWORK:-default}
+    image: echpochmak/kv-node:dev
+    environment: &kv-env
+      ECHPOCHMAK_KV_ID: "1"
+      ECHPOCHMAK_KV_DATA_DIR: /data
+      ECHPOCHMAK_KV_INITIAL_CLUSTER: 1=http://kv1:2380,2=http://kv2:2380,3=http://kv3:2380
+      ECHPOCHMAK_KV_LOG_FORMAT: text
+    ports:
+      - "23791:2379"
+    volumes:
+      - kv1-data:/data
+
+  kv2:
+    <<: *kv-node
+    environment:
+      <<: *kv-env
+      ECHPOCHMAK_KV_ID: "2"
+    ports:
+      - "23792:2379"
+    volumes:
+      - kv2-data:/data
+
+  kv3:
+    <<: *kv-node
+    environment:
+      <<: *kv-env
+      ECHPOCHMAK_KV_ID: "3"
+    ports:
+      - "23793:2379"
+    volumes:
+      - kv3-data:/data
+
 networks:
   default:
     ipam:
@@ -98,3 +138,6 @@ networks:
 
 volumes:
   minio-data:
+  kv1-data:
+  kv2-data:
+  kv3-data:

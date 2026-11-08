@@ -1,0 +1,36 @@
+syntax = "proto3";
+
+package echpochmak.kv.v1;
+
+option go_package = "echpochmak/internal/kv/kvpb;kvpb";
+
+// PeerService carries raft traffic between nodes. It is internal to the
+// cluster. Every call carries the cluster ID in the "x-kv-cluster-id"
+// metadata, and nodes reject calls from another cluster.
+service PeerService {
+  // Raft is a long-lived stream of raft messages from one node to another.
+  rpc Raft(stream RaftRequest) returns (RaftResponse);
+  // Snapshot sends a state snapshot to a follower: a header, data chunks,
+  // then a trailer with the checksum.
+  rpc Snapshot(stream SnapshotRequest) returns (SnapshotResponse);
+}
+
+message RaftRequest {
+  // A raftpb.Message in protobuf encoding.
+  bytes message = 1;
+}
+
+message RaftResponse {}
+
+message SnapshotRequest {
+  oneof chunk {
+    // The raftpb.Message of type MsgSnap, in protobuf encoding. Its
+    // snapshot metadata describes the data that follows.
+    bytes header = 1;
+    bytes data = 2;
+    // CRC-32C (Castagnoli) of all data chunks.
+    uint32 checksum = 3;
+  }
+}
+
+message SnapshotResponse {}

@@ -100,7 +100,7 @@ Phases 1 and 2 are independent and can run in parallel.
 - No auth: the server doesn't advertise the OAuth endpoints.
 - **Milestone:** Trino can create a table, append data and read it back through the server.
 
-### Phase 2: Raft KV cluster (`kv-node`)
+### Phase 2: Raft KV cluster (`kv-node`) (done, 2026-11-08)
 1. **State machine:** an ordered KV store (Pebble or bbolt) with MVCC revisions; Range/Put/Delete/`Txn{compares, success, failure}`; deterministic apply.
 2. **Single raft node:** the `raft.Node` Ready loop; a WAL that persists `HardState` and entries before sending messages; apply committed entries.
 3. **Snapshots and compaction:** snapshot the state machine every N entries, truncate the WAL, and restore on startup.

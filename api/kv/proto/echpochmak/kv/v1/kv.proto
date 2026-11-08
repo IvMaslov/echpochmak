@@ -1,0 +1,150 @@
+syntax = "proto3";
+
+package echpochmak.kv.v1;
+
+option go_package = "echpochmak/internal/kv/kvpb;kvpb";
+
+// KVService is the client API of the cluster. Every node serves it: writes
+// are replicated through raft, reads are linearizable unless they ask to be
+// serializable.
+service KVService {
+  // Range returns the keys in [key, range_end).
+  rpc Range(RangeRequest) returns (RangeResponse);
+  // Put creates or replaces a key.
+  rpc Put(PutRequest) returns (PutResponse);
+  // DeleteRange deletes the keys in [key, range_end).
+  rpc DeleteRange(DeleteRangeRequest) returns (DeleteRangeResponse);
+  // Txn evaluates compares and runs the success or failure operations,
+  // atomically.
+  rpc Txn(TxnRequest) returns (TxnResponse);
+}
+
+// ResponseHeader describes the node and state that served a request.
+message ResponseHeader {
+  // Store-wide revision after the request.
+  int64 revision = 1;
+  // ID of the node that served the request.
+  uint64 member_id = 2;
+  // Raft term of the serving node.
+  uint64 raft_term = 3;
+}
+
+// KeyValue is a key with its value and revisions.
+message KeyValue {
+  bytes key = 1;
+  bytes value = 2;
+  // Revision of the write that created the key.
+  int64 create_revision = 3;
+  // Revision of the last write to the key.
+  int64 mod_revision = 4;
+  // Number of writes since the key was created.
+  int64 version = 5;
+}
+
+message RangeRequest {
+  bytes key = 1;
+  // End of the range, exclusive. Empty means only key; "\0" means every key
+  // from key on.
+  bytes range_end = 2;
+  // Maximum number of keys returned; 0 means the server limit.
+  int64 limit = 3;
+  // Serve from local state without confirming leadership. The result may be
+  // stale.
+  bool serializable = 4;
+}
+
+message RangeResponse {
+  ResponseHeader header = 1;
+  repeated KeyValue kvs = 2;
+  // More keys exist in the range after the last one returned.
+  bool more = 3;
+}
+
+message PutRequest {
+  bytes key = 1;
+  bytes value = 2;
+  // Identifies the write for deduplication; retries must reuse it. Empty
+  // disables deduplication.
+  bytes request_id = 3;
+}
+
+message PutResponse {
+  ResponseHeader header = 1;
+}
+
+message DeleteRangeRequest {
+  bytes key = 1;
+  // As in RangeRequest.
+  bytes range_end = 2;
+  // As in PutRequest.
+  bytes request_id = 3;
+}
+
+message DeleteRangeResponse {
+  ResponseHeader header = 1;
+  // Number of keys deleted.
+  int64 deleted = 2;
+}
+
+// Compare is a condition on the current state, evaluated by Txn.
+message Compare {
+  enum Result {
+    RESULT_UNSPECIFIED = 0;
+    RESULT_EQUAL = 1;
+    RESULT_NOT_EQUAL = 2;
+    RESULT_LESS = 3;
+    RESULT_GREATER = 4;
+  }
+
+  Result result = 1;
+  bytes key = 2;
+  // Only for range_count: the end of the counted range, as in RangeRequest.
+  bytes range_end = 3;
+
+  oneof target {
+    // Revision of the last write to key; 0 when the key does not exist.
+    int64 mod_revision = 4;
+    // Number of writes to key since it was created; 0 when it does not exist.
+    int64 version = 5;
+    // Value of key; a missing key never matches.
+    bytes value = 6;
+    // Number of keys in [key, range_end).
+    int64 range_count = 7;
+  }
+}
+
+// RequestOp is one operation of a Txn branch.
+message RequestOp {
+  oneof request {
+    RangeRequest request_range = 1;
+    PutRequest request_put = 2;
+    DeleteRangeRequest request_delete_range = 3;
+  }
+}
+
+// ResponseOp is the result of one RequestOp.
+message ResponseOp {
+  oneof response {
+    RangeResponse response_range = 1;
+    PutResponse response_put = 2;
+    DeleteRangeResponse response_delete_range = 3;
+  }
+}
+
+message TxnRequest {
+  // Every compare must hold for the success branch to run.
+  repeated Compare compare = 1;
+  repeated RequestOp success = 2;
+  repeated RequestOp failure = 3;
+  // As in PutRequest. Request IDs of the operations inside are ignored.
+  bytes request_id = 4;
+  // For a read-only Txn: serve from local state, as in RangeRequest.
+  bool serializable = 5;
+}
+
+message TxnResponse {
+  ResponseHeader header = 1;
+  // Whether the success branch ran.
+  bool succeeded = 2;
+  repeated ResponseOp responses = 3;
+}

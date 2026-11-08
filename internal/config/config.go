@@ -1,10 +1,11 @@
-// Package config loads the catalog-server configuration from command-line
-// flags and environment variables.
+// Package config loads the configuration of the catalog-server and kv-node
+// binaries from command-line flags and environment variables.
 //
 // Every flag has an environment variable named after it: the flag name in
-// upper case, with dashes replaced by underscores, prefixed with [EnvPrefix].
-// For example, -http-addr can be set with ECHPOCHMAK_HTTP_ADDR. A flag given
-// on the command line wins over its environment variable.
+// upper case, with dashes replaced by underscores, prefixed with [EnvPrefix]
+// for catalog-server and [KVEnvPrefix] for kv-node. For example, -http-addr
+// can be set with ECHPOCHMAK_HTTP_ADDR. A flag given on the command line wins
+// over its environment variable.
 package config
 
 import (
@@ -137,7 +138,7 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 		return Config{}, fmt.Errorf("parsing flags: %w", err)
 	}
 
-	if err := applyEnv(fs, getenv); err != nil {
+	if err := applyEnv(fs, EnvPrefix, getenv); err != nil {
 		return Config{}, err
 	}
 
@@ -148,19 +149,11 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 	return cfg, nil
 }
 
-// Usage returns the help text of all flags.
+// Usage returns the help text of all catalog-server flags.
 func Usage() string {
-	var (
-		cfg Config
-		b   strings.Builder
-	)
+	var cfg Config
 
-	fs := flag.NewFlagSet("catalog-server", flag.ContinueOnError)
-	register(fs, &cfg)
-	fs.SetOutput(&b)
-	fs.PrintDefaults()
-
-	return b.String()
+	return usage("catalog-server", func(fs *flag.FlagSet) { register(fs, &cfg) })
 }
 
 func register(fs *flag.FlagSet, cfg *Config) {
@@ -210,8 +203,8 @@ func register(fs *flag.FlagSet, cfg *Config) {
 }
 
 // applyEnv sets every flag that was not given on the command line from its
-// environment variable, if that is set.
-func applyEnv(fs *flag.FlagSet, getenv func(string) string) error {
+// environment variable, named with prefix, if that is set.
+func applyEnv(fs *flag.FlagSet, prefix string, getenv func(string) string) error {
 	given := map[string]bool{}
 	fs.Visit(func(f *flag.Flag) { given[f.Name] = true })
 
@@ -222,7 +215,7 @@ func applyEnv(fs *flag.FlagSet, getenv func(string) string) error {
 			return
 		}
 
-		name := EnvName(f.Name)
+		name := envName(prefix, f.Name)
 
 		value := getenv(name)
 		if value == "" {
@@ -237,9 +230,26 @@ func applyEnv(fs *flag.FlagSet, getenv func(string) string) error {
 	return errors.Join(errs...)
 }
 
-// EnvName returns the environment variable that backs the flag named flagName.
+// EnvName returns the environment variable that backs the catalog-server
+// flag named flagName.
 func EnvName(flagName string) string {
-	return EnvPrefix + strings.ToUpper(strings.ReplaceAll(flagName, "-", "_"))
+	return envName(EnvPrefix, flagName)
+}
+
+func envName(prefix, flagName string) string {
+	return prefix + strings.ToUpper(strings.ReplaceAll(flagName, "-", "_"))
+}
+
+// usage returns the help text of the flags registered by register.
+func usage(name string, register func(*flag.FlagSet)) string {
+	var b strings.Builder
+
+	fs := flag.NewFlagSet(name, flag.ContinueOnError)
+	register(fs)
+	fs.SetOutput(&b)
+	fs.PrintDefaults()
+
+	return b.String()
 }
 
 // Validate reports every invalid setting of cfg.

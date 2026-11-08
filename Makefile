@@ -20,7 +20,7 @@ LDFLAGS    := -s -w \
 	-X echpochmak/internal/version.commit=$(COMMIT) \
 	-X echpochmak/internal/version.buildDate=$(BUILD_DATE)
 
-BINARIES := catalog-server kv-node
+BINARIES := catalog-server kv-node kvctl
 
 # Iceberg REST spec, pinned by commit. Bump SPEC_COMMIT and run `make spec-update`.
 SPEC_COMMIT := 79bc69a51da6d95ccd6da6d46ef156c74e30b8cf
@@ -63,8 +63,16 @@ generate: ## Regenerate code (go generate ./...)
 
 .PHONY: check-generate
 check-generate: generate ## Fail if generated code is out of date
-	@test -z "$$(git status --porcelain -- internal/api/gen)" || \
+	@test -z "$$(git status --porcelain -- internal/api/gen internal/kv/kvpb)" || \
 		(echo "Generated code is out of date: run 'make generate' and commit the result." && exit 1)
+
+.PHONY: buf-breaking
+buf-breaking: ## Fail if the KV protocol changed incompatibly since the last commit
+	@if git cat-file -e HEAD:api/kv/buf.yaml 2>/dev/null; then \
+		cd api/kv && go tool buf breaking --against '../../.git#subdir=api/kv'; \
+	else \
+		echo "buf-breaking: api/kv is not committed yet, nothing to compare against"; \
+	fi
 
 ##@ Build and run
 
@@ -104,6 +112,19 @@ e2e: deployments/compose/.env ## Start the compose stack and run the Trino end-t
 	$(COMPOSE) up -d --build --wait
 	go test -tags e2e -count=1 -v ./test/e2e/
 
+.PHONY: kv-torture
+kv-torture: ## Run the in-process linearizability check for longer, with a random seed
+	KV_TORTURE_SEED=$${KV_TORTURE_SEED:-$$RANDOM} KV_TORTURE_DURATION=$${KV_TORTURE_DURATION:-60s} \
+		go test -race -count=1 -run TestLinearizableUnderFaults -v -timeout 30m ./internal/kv/node/
+
+.PHONY: kv-chaos
+kv-chaos: deployments/compose/.env ## Check a 3-node KV cluster in docker for linearizability under chaos, then remove it
+	$(COMPOSE) --profile kv up -d --build kv1 kv2 kv3
+	status=0; go test -tags kvchaos -count=1 -v -timeout 30m ./test/kvchaos/ || status=$$?; \
+		$(COMPOSE) --profile kv rm -fsv kv1 kv2 kv3; \
+		docker volume rm -f echpochmak_kv1-data echpochmak_kv2-data echpochmak_kv3-data >/dev/null; \
+		exit $$status
+
 .PHONY: cover
 cover: ## Run tests with coverage and write an HTML report
 	go test -race -count=1 -covermode=atomic -coverprofile=$(COVER_PROFILE) ./...
@@ -126,7 +147,7 @@ tidy: ## Tidy and verify go.mod
 		(echo "go.mod/go.sum changed: commit the result of 'go mod tidy'." && exit 1)
 
 .PHONY: ci
-ci: tidy check-generate lint test build ## Run every check CI runs
+ci: tidy check-generate buf-breaking lint test build ## Run every check CI runs
 
 ##@ Local environment
 
