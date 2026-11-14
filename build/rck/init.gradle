@@ -1,0 +1,31 @@
+// Applies echpochmak's RCK exclusions without patching the Iceberg sources.
+//
+// The file named by the RCK_EXCLUSIONS environment variable holds one test
+// pattern per line, as Gradle's excludeTestsMatching takes it. Text after '#'
+// is a comment: the reason for the exclusion.
+allprojects {
+    afterEvaluate { project ->
+        if (project.path != ':iceberg-open-api') {
+            return
+        }
+
+        project.tasks.named('test') { task ->
+            def path = System.getenv('RCK_EXCLUSIONS')
+            if (path != null && new File(path).exists()) {
+                new File(path).eachLine { line ->
+                    def pattern = line.replaceFirst('#.*', '').trim()
+                    if (!pattern.isEmpty()) {
+                        task.filter.excludeTestsMatching(pattern)
+                    }
+                }
+            }
+
+            task.filter.failOnNoMatchingTests = false
+            task.testLogging {
+                events 'failed', 'skipped'
+                exceptionFormat 'full'
+                showStandardStreams = false
+            }
+        }
+    }
+}

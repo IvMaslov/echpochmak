@@ -15,6 +15,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"time"
 
 	"echpochmak/internal/kv/client"
@@ -22,9 +23,17 @@ import (
 	"echpochmak/internal/store"
 )
 
-// MaxCommitsPerTxn bounds CommitTables. A create needs three compares, and the
-// KV store accepts 128 compares and 128 operations per branch.
-const MaxCommitsPerTxn = 42
+// TxnBudget is the number of compares, and of operations per branch, that the
+// KV store accepts in one transaction. It bounds CommitTables and GetTables:
+// in a commit, an update costs one compare and one read, a create three of
+// each, so one transaction holds up to 128 updates or 42 creates.
+const TxnBudget = 128
+
+// Costs of one commit against [TxnBudget].
+const (
+	updateCost = 1
+	createCost = 3
+)
 
 // casRetries bounds the read-modify-write loops of property updates and
 // renames, which retry when a concurrent write wins the race.
@@ -126,6 +135,23 @@ func (s *Store) get(ctx context.Context, key []byte) (*kvpb.KeyValue, error) {
 	}
 
 	return kv, nil
+}
+
+// pause waits before retry attempt+1 of a lost compare-and-swap: a random
+// time up to 2^attempt milliseconds, so competing writers spread out.
+func pause(ctx context.Context, attempt int) error {
+	limit := time.Millisecond << min(attempt, 8)
+	wait := time.Duration(rand.Int64N(int64(limit))) //nolint:gosec // G404: jitter needs no cryptographic randomness.
+	t := time.NewTimer(wait)
+
+	defer t.Stop()
+
+	select {
+	case <-ctx.Done():
+		return fmt.Errorf("raftstore: %w", ctx.Err())
+	case <-t.C:
+		return nil
+	}
 }
 
 func checkCtx(ctx context.Context) error {

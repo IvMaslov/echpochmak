@@ -181,3 +181,98 @@ func TestConfigAdvertisesIdempotency(t *testing.T) {
 		t.Fatalf("a server without idempotency advertises %q", *none.Lifetime)
 	}
 }
+
+func TestIdempotentTransactionAcrossReplicas(t *testing.T) {
+	t.Parallel()
+
+	a, b := replicas(t)
+	a.expect(http.StatusOK, http.MethodPost, "/v1/main/namespaces", `{"namespace":["db"]}`, nil)
+	a.expect(http.StatusOK, http.MethodPost, "/v1/main/namespaces/db/tables", createTableBody, nil)
+
+	body := `{"table-changes": [{"identifier": {"namespace": ["db"], "name": "t"},
+		"requirements": [], "updates": [{"action": "set-properties", "updates": {"k": "v"}}]}]}`
+
+	mustStatus(t, withKey(a, keyA, http.MethodPost, "/v1/main/transactions/commit", body), http.StatusNoContent, false)
+
+	var before tableResult
+	a.expect(http.StatusOK, http.MethodGet, "/v1/main/namespaces/db/tables/t", "", &before)
+
+	// The retry reaches the other replica and is not applied again.
+	mustStatus(t, withKey(b, keyA, http.MethodPost, "/v1/main/transactions/commit", body), http.StatusNoContent, true)
+
+	var after tableResult
+	a.expect(http.StatusOK, http.MethodGet, "/v1/main/namespaces/db/tables/t", "", &after)
+
+	if after.MetadataLocation != before.MetadataLocation {
+		t.Fatal("the replayed transaction committed again")
+	}
+}
+
+func TestIdempotentViewCreateAcrossReplicas(t *testing.T) {
+	t.Parallel()
+
+	a, b := replicas(t)
+	a.expect(http.StatusOK, http.MethodPost, "/v1/main/namespaces", `{"namespace":["db"]}`, nil)
+
+	first := withKey(a, keyA, http.MethodPost, "/v1/main/namespaces/db/views", createViewBody)
+	mustStatus(t, first, http.StatusOK, false)
+
+	again := withKey(b, keyA, http.MethodPost, "/v1/main/namespaces/db/views", createViewBody)
+	mustStatus(t, again, http.StatusOK, true)
+
+	var v1, v2 viewResult
+	if json.Unmarshal(first.Body.Bytes(), &v1) != nil || json.Unmarshal(again.Body.Bytes(), &v2) != nil ||
+		v1.MetadataLocation == "" || v1.MetadataLocation != v2.MetadataLocation {
+		t.Fatalf("replay served %q, the create returned %q", v2.MetadataLocation, v1.MetadataLocation)
+	}
+}
+
+func TestIdempotentUnregisterAcrossReplicas(t *testing.T) {
+	t.Parallel()
+
+	a, b := replicas(t)
+	a.expect(http.StatusOK, http.MethodPost, "/v1/main/namespaces", `{"namespace":["db"]}`, nil)
+	a.expect(http.StatusOK, http.MethodPost, "/v1/main/namespaces/db/tables", createTableBody, nil)
+
+	const target = "/v1/main/namespaces/db/tables/t/unregister"
+
+	first := withKey(a, keyA, http.MethodPost, target, "")
+	mustStatus(t, first, http.StatusOK, false)
+
+	// The table is gone; the replay reads the same metadata file again.
+	again := withKey(b, keyA, http.MethodPost, target, "")
+	mustStatus(t, again, http.StatusOK, true)
+
+	var r1, r2 tableResult
+	if json.Unmarshal(first.Body.Bytes(), &r1) != nil || json.Unmarshal(again.Body.Bytes(), &r2) != nil ||
+		r1.MetadataLocation != r2.MetadataLocation || r2.Metadata.TableUUID != r1.Metadata.TableUUID {
+		t.Fatalf("replay %+v, first %+v", r2, r1)
+	}
+
+	// Without the key, a second unregister finds no table.
+	b.expectError(http.StatusNotFound, "NoSuchTableException", http.MethodPost, target, "")
+}
+
+func TestIdempotentRegisterAcrossReplicas(t *testing.T) {
+	t.Parallel()
+
+	a, b := replicas(t)
+	a.expect(http.StatusOK, http.MethodPost, "/v1/main/namespaces", `{"namespace":["db"]}`, nil)
+
+	var created tableResult
+	a.expect(http.StatusOK, http.MethodPost, "/v1/main/namespaces/db/tables", createTableBody, &created)
+	a.expect(http.StatusOK, http.MethodPost, "/v1/main/namespaces/db/tables/t/unregister", "", nil)
+
+	body := `{"name": "r", "metadata-location": "` + created.MetadataLocation + `"}`
+
+	mustStatus(t, withKey(a, keyB, http.MethodPost, "/v1/main/namespaces/db/register", body), http.StatusOK, false)
+
+	// Re-running would fail with 409; the replay serves the registered table.
+	again := withKey(b, keyB, http.MethodPost, "/v1/main/namespaces/db/register", body)
+	mustStatus(t, again, http.StatusOK, true)
+
+	var tbl tableResult
+	if json.Unmarshal(again.Body.Bytes(), &tbl) != nil || tbl.MetadataLocation != created.MetadataLocation {
+		t.Fatalf("replay served %s", again.Body.String())
+	}
+}

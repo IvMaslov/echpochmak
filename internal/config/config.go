@@ -60,6 +60,13 @@ type Catalog struct {
 	// IdempotencyLifetime is how long an Idempotency-Key is honoured; zero
 	// disables idempotency support.
 	IdempotencyLifetime time.Duration
+	// PurgeWorkers is how many purge tasks this replica runs at once; zero
+	// turns its purge worker off, leaving the tasks to other replicas.
+	PurgeWorkers int
+	// PurgeLease is how long a purge worker's claim on a task lasts.
+	PurgeLease time.Duration
+	// PurgeInterval is how often an idle purge worker scans the queue.
+	PurgeInterval time.Duration
 }
 
 // HTTP configures the HTTP server.
@@ -77,6 +84,8 @@ type HTTP struct {
 	// DrainDelay is how long a stopping server keeps serving while it reports
 	// itself unready, so a load balancer moves new requests elsewhere first.
 	DrainDelay time.Duration
+	// Docs serves the Swagger UI and the served spec.
+	Docs bool
 }
 
 // Store selects and configures the store backend.
@@ -200,6 +209,13 @@ func register(fs *flag.FlagSet, cfg *Config) {
 
 	fs.DurationVar(&cfg.Catalog.IdempotencyLifetime, "idempotency-lifetime", 30*time.Minute,
 		"how long an Idempotency-Key is honoured; 0 disables idempotency support")
+	fs.IntVar(&cfg.Catalog.PurgeWorkers, "purge-workers", 2,
+		"purge tasks run at once by this replica; 0 leaves them to other replicas")
+	fs.DurationVar(&cfg.Catalog.PurgeLease, "purge-lease", 2*time.Minute,
+		"how long a purge worker's claim on a task lasts; renewed between delete batches")
+	fs.DurationVar(&cfg.Catalog.PurgeInterval, "purge-interval", 10*time.Second,
+		"how often an idle purge worker scans the queue, jittered")
+	fs.BoolVar(&cfg.HTTP.Docs, "docs", true, "serve the Swagger UI at /docs and the spec at /openapi.json")
 
 	fs.StringVar(&cfg.Store.Backend, "store-backend", StoreMemory, "store backend: memory or raft")
 	fs.Func("kv-endpoints", "KV cluster client endpoints, comma-separated (raft backend)", func(v string) error {
@@ -387,6 +403,15 @@ func (c Catalog) validate() []error {
 		errs = append(errs, fmt.Errorf("metadata-cache-size must not be negative, got %d", c.MetadataCacheSize))
 	}
 
+	if c.PurgeWorkers < 0 {
+		errs = append(errs, fmt.Errorf("purge-workers must not be negative, got %d", c.PurgeWorkers))
+	}
+
+	if c.PurgeLease <= 0 || c.PurgeInterval <= 0 {
+		errs = append(errs, fmt.Errorf("purge-lease and purge-interval must be positive, got %s and %s",
+			c.PurgeLease, c.PurgeInterval))
+	}
+
 	return errs
 }
 
@@ -402,12 +427,16 @@ func (cfg Config) LogValue() slog.Value {
 			slog.Duration("shutdown_timeout", cfg.HTTP.ShutdownTimeout),
 			slog.Int64("max_body_bytes", cfg.HTTP.MaxBodyBytes),
 			slog.Duration("drain_delay", cfg.HTTP.DrainDelay),
+			slog.Bool("docs", cfg.HTTP.Docs),
 		),
 		slog.Group("catalog",
 			slog.String("name", cfg.Catalog.Name),
 			slog.Int("commit_retries", cfg.Catalog.CommitRetries),
 			slog.Int("metadata_cache_size", cfg.Catalog.MetadataCacheSize),
 			slog.Duration("idempotency_lifetime", cfg.Catalog.IdempotencyLifetime),
+			slog.Int("purge_workers", cfg.Catalog.PurgeWorkers),
+			slog.Duration("purge_lease", cfg.Catalog.PurgeLease),
+			slog.Duration("purge_interval", cfg.Catalog.PurgeInterval),
 		),
 		slog.Group("log",
 			slog.String("min_level", cfg.Log.Level.String()),

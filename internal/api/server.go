@@ -14,6 +14,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -53,6 +54,11 @@ func NewServer(svc *catalog.Service, prefix string, opts ...ServerOption) *Serve
 	}
 
 	return s
+}
+
+// loadMetadata reads a table metadata file, for idempotent replays.
+func (s *Server) loadMetadata(ctx context.Context, location string) (json.RawMessage, error) {
+	return s.catalog.LoadTableMetadataFile(ctx, location)
 }
 
 // checkPrefix rejects requests for another catalog.
@@ -133,5 +139,16 @@ func Endpoints() []string {
 		"DELETE /v1/{prefix}/namespaces/{namespace}/tables/{table}",
 		"POST /v1/{prefix}/tables/rename",
 		"POST /v1/{prefix}/namespaces/{namespace}/tables/{table}/metrics",
+		"POST /v1/{prefix}/namespaces/{namespace}/register",
+		"POST /v1/{prefix}/namespaces/{namespace}/tables/{table}/unregister",
+		"POST /v1/{prefix}/transactions/commit",
+		"GET /v1/{prefix}/namespaces/{namespace}/views",
+		"POST /v1/{prefix}/namespaces/{namespace}/views",
+		"GET /v1/{prefix}/namespaces/{namespace}/views/{view}",
+		"HEAD /v1/{prefix}/namespaces/{namespace}/views/{view}",
+		"POST /v1/{prefix}/namespaces/{namespace}/views/{view}",
+		"DELETE /v1/{prefix}/namespaces/{namespace}/views/{view}",
+		"POST /v1/{prefix}/views/rename",
+		"POST /v1/{prefix}/namespaces/{namespace}/register-view",
 	}
 }

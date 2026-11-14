@@ -3,6 +3,7 @@ package raftstore
 import (
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"echpochmak/internal/store"
 )
@@ -16,6 +17,7 @@ const (
 	spaceNamespaces = "ns/"
 	spaceTables     = "tbl/"
 	spaceViews      = "view/"
+	spacePurges     = "purge/"
 	pingKey         = "ping"
 )
 
@@ -42,6 +44,15 @@ func (k keys) children(space string, parent store.Namespace) []byte {
 
 func (k keys) namespace(ns store.Namespace) []byte {
 	return k.child(spaceNamespaces, ns.Parent(), ns.Name())
+}
+
+// purges returns the prefix of every purge task.
+func (k keys) purges() []byte {
+	return []byte(k.prefix + spacePurges)
+}
+
+func (k keys) purge(id string) []byte {
+	return []byte(k.prefix + spacePurges + id)
 }
 
 func (k keys) ping() []byte {
@@ -75,6 +86,16 @@ type namespaceValue struct {
 // pointerValue is the JSON value of a table or view key.
 type pointerValue struct {
 	MetadataLocation string `json:"metadata_location"`
+}
+
+// purgeValue is the JSON value of a purge task key.
+type purgeValue struct {
+	Namespace        []string  `json:"namespace"`
+	Name             string    `json:"name"`
+	MetadataLocation string    `json:"metadata_location"`
+	Created          time.Time `json:"created"`
+	ClaimOwner       string    `json:"claim_owner,omitempty"`
+	ClaimUntil       time.Time `json:"claim_until,omitzero"`
 }
 
 func encode(v any) ([]byte, error) {

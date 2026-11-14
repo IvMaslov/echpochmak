@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -36,22 +37,41 @@ const (
 	routeCommitTable     = "POST /v1/{prefix}/namespaces/{namespace}/tables/{table}"
 	routeDropTable       = "DELETE /v1/{prefix}/namespaces/{namespace}/tables/{table}"
 	routeRenameTable     = "POST /v1/{prefix}/tables/rename"
+	routeRegisterTable   = "POST /v1/{prefix}/namespaces/{namespace}/register"
+	routeUnregister      = "POST /v1/{prefix}/namespaces/{namespace}/tables/{table}/unregister"
+	routeTransaction     = "POST /v1/{prefix}/transactions/commit"
+	routeCreateView      = "POST /v1/{prefix}/namespaces/{namespace}/views"
+	routeReplaceView     = "POST /v1/{prefix}/namespaces/{namespace}/views/{view}"
+	routeDropView        = "DELETE /v1/{prefix}/namespaces/{namespace}/views/{view}"
+	routeRenameView      = "POST /v1/{prefix}/views/rename"
+	routeRegisterView    = "POST /v1/{prefix}/namespaces/{namespace}/register-view"
 )
 
 func idempotentRoute(pattern string) bool {
 	switch pattern {
 	case routeCreateNamespace, routeDropNamespace, routeUpdateProps,
-		routeCreateTable, routeCommitTable, routeDropTable, routeRenameTable:
+		routeCreateTable, routeCommitTable, routeDropTable, routeRenameTable,
+		routeRegisterTable, routeUnregister, routeTransaction,
+		routeCreateView, routeReplaceView, routeDropView, routeRenameView, routeRegisterView:
 		return true
 	default:
 		return false
 	}
 }
 
+// MetadataLoader reads a table metadata file, as stored. Replays of an
+// unregister use it.
+type MetadataLoader func(ctx context.Context, location string) (json.RawMessage, error)
+
 // withIdempotency applies the Idempotency-Key protocol to the mutations in
 // scope. It needs the raw body, so it runs inside withRawBody, and the mux,
 // to know which route a request takes before serving it.
-func withIdempotency(g *idempotency.Guard, mux *http.ServeMux, next http.Handler) http.Handler {
+func withIdempotency(
+	g *idempotency.Guard,
+	load MetadataLoader,
+	mux *http.ServeMux,
+	next http.Handler,
+) http.Handler {
 	if g == nil {
 		return next
 	}
@@ -86,18 +106,26 @@ func withIdempotency(g *idempotency.Guard, mux *http.ServeMux, next http.Handler
 			return
 		}
 
-		serveIdempotent(g, next, w, r, key, pattern, body)
+		serveIdempotent(g, load, next, w, r, idempotentRequest{key: key, pattern: pattern, body: body})
 	})
+}
+
+// idempotentRequest is a request taking part in the protocol.
+type idempotentRequest struct {
+	key     string
+	pattern string
+	body    []byte
 }
 
 func serveIdempotent(
 	g *idempotency.Guard,
+	load MetadataLoader,
 	next http.Handler,
 	w http.ResponseWriter,
 	r *http.Request,
-	key, pattern string,
-	body []byte,
+	req idempotentRequest,
 ) {
+	key, pattern, body := req.key, req.pattern, req.body
 	ctx := r.Context()
 
 	decision, rec, ticket, err := g.Begin(ctx, key, fingerprint(r, body))
@@ -111,7 +139,7 @@ func serveIdempotent(
 
 	switch decision {
 	case idempotency.Replay:
-		replay(next, w, r, rec.Response)
+		replay(next, load, w, r, rec.Response)
 	case idempotency.Mismatch:
 		writeErrorModel(w, r, http.StatusUnprocessableEntity, typeUnprocessable,
 			"Idempotency-Key was already used for a different request")
@@ -144,11 +172,23 @@ func stagedCreate(body []byte) bool {
 	return json.Unmarshal(body, &req) == nil && req.StageCreate
 }
 
-// replay answers with a stored response. A table response is served by
-// loading the table now, which the spec allows: a replay may show a newer
-// state of the catalog.
-func replay(next http.Handler, w http.ResponseWriter, r *http.Request, resp idempotency.Response) {
+// replay answers with a stored response. A table or view response is served
+// by loading it now, which the spec allows: a replay may show a newer state
+// of the catalog.
+func replay(
+	next http.Handler,
+	load MetadataLoader,
+	w http.ResponseWriter,
+	r *http.Request,
+	resp idempotency.Response,
+) {
 	w.Header().Set(HeaderIdempotentReplay, "true")
+
+	if resp.ReplayMetadata != "" {
+		replayUnregister(load, w, r, resp.ReplayMetadata)
+
+		return
+	}
 
 	if resp.ReplayPath != "" {
 		get := r.Clone(r.Context())
@@ -186,6 +226,24 @@ func replay(next http.Handler, w http.ResponseWriter, r *http.Request, resp idem
 	_, _ = w.Write(resp.Body)
 }
 
+// replayUnregister answers a repeated unregister from the metadata file it
+// returned the first time. If that file is gone, the answer is what running
+// the unregister again would give: the table does not exist.
+func replayUnregister(load MetadataLoader, w http.ResponseWriter, r *http.Request, location string) {
+	md, err := load(r.Context(), location)
+	if err != nil {
+		writeErrorModel(w, r, http.StatusNotFound, typeNoSuchTable,
+			"Table does not exist: its metadata file "+location+" is gone")
+
+		return
+	}
+
+	body := unregisterResponseBody{MetadataLocation: location, Metadata: md}
+	if err := writeRawJSON(w, http.StatusOK, body); err != nil {
+		logger.FromContext(r.Context()).DebugContext(r.Context(), "writing a replay failed", logger.Err(err))
+	}
+}
+
 // captureWriter records a response while writing it.
 type captureWriter struct {
 	http.ResponseWriter
@@ -215,8 +273,9 @@ func (c *captureWriter) Unwrap() http.ResponseWriter {
 	return c.ResponseWriter
 }
 
-// response is what to store for replay. Successful table creates and commits
-// are replayed by loading the table, so their large metadata is not stored.
+// response is what to store for replay. Successful responses that carry
+// table or view metadata are replayed by loading the entry again, so their
+// large metadata is not stored.
 func (c *captureWriter) response(r *http.Request, pattern string, body []byte) idempotency.Response {
 	resp := idempotency.Response{
 		Status:      c.status,
@@ -225,21 +284,11 @@ func (c *captureWriter) response(r *http.Request, pattern string, body []byte) i
 	}
 
 	if c.status == http.StatusOK {
-		switch pattern {
-		case routeCommitTable:
-			resp.ReplayPath = r.URL.EscapedPath()
+		if path, location := replaySource(r, pattern, body, c.body.Bytes()); path != "" || location != "" {
+			resp.ReplayPath = path
+			resp.ReplayMetadata = location
 
 			return resp
-		case routeCreateTable:
-			var req struct {
-				Name string `json:"name"`
-			}
-
-			if json.Unmarshal(body, &req) == nil && req.Name != "" {
-				resp.ReplayPath = strings.TrimSuffix(r.URL.EscapedPath(), "/") + "/" + url.PathEscape(req.Name)
-
-				return resp
-			}
 		}
 	}
 
@@ -253,4 +302,51 @@ func (c *captureWriter) response(r *http.Request, pattern string, body []byte) i
 	resp.Body = bytes.Clone(c.body.Bytes())
 
 	return resp
+}
+
+// replaySource returns where the replay of a successful response comes from:
+// the path to GET, or for an unregister the metadata file to read. Both are
+// empty when the response itself is stored.
+func replaySource(r *http.Request, pattern string, reqBody, respBody []byte) (path, location string) {
+	reqPath := strings.TrimSuffix(r.URL.EscapedPath(), "/")
+
+	switch pattern {
+	case routeCommitTable, routeReplaceView:
+		return reqPath, ""
+	case routeCreateTable, routeCreateView:
+		if name := bodyName(reqBody); name != "" {
+			return reqPath + "/" + url.PathEscape(name), ""
+		}
+	case routeRegisterTable:
+		if name := bodyName(reqBody); name != "" {
+			return strings.TrimSuffix(reqPath, "/register") + "/tables/" + url.PathEscape(name), ""
+		}
+	case routeRegisterView:
+		if name := bodyName(reqBody); name != "" {
+			return strings.TrimSuffix(reqPath, "/register-view") + "/views/" + url.PathEscape(name), ""
+		}
+	case routeUnregister:
+		var resp struct {
+			MetadataLocation string `json:"metadata-location"`
+		}
+
+		if json.Unmarshal(respBody, &resp) == nil && resp.MetadataLocation != "" {
+			return "", resp.MetadataLocation
+		}
+	}
+
+	return "", ""
+}
+
+// bodyName returns the "name" field of a request body.
+func bodyName(body []byte) string {
+	var req struct {
+		Name string `json:"name"`
+	}
+
+	if json.Unmarshal(body, &req) != nil {
+		return ""
+	}
+
+	return req.Name
 }

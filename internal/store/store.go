@@ -11,6 +11,9 @@
 //     from any client, observes it.
 //   - Atomic multi-table commits: [Store.CommitTables] applies all commits or
 //     none.
+//   - A durable purge queue: a table dropped with [DropOptions.Purge] leaves a
+//     [PurgeTask], written atomically with the drop, until a worker completes
+//     it.
 //   - Monotonic versions: every write gets a version strictly greater than any
 //     version issued before, so a version is never reused, even after an entry
 //     is dropped and recreated.
@@ -50,6 +53,10 @@ type Store interface {
 
 	// GetTable returns the pointer of a table.
 	GetTable(ctx context.Context, id Ident) (Pointer, error)
+	// GetTables returns the pointers of several tables, in the order of ids,
+	// read at one point in time. A table that does not exist has a pointer
+	// with Version 0 and no metadata location; it is not an error.
+	GetTables(ctx context.Context, ids []Ident) ([]Pointer, error)
 	// ListTables returns the tables of ns, sorted by name.
 	ListTables(ctx context.Context, ns Namespace, req PageRequest) (Page[Ident], error)
 	// CommitTables applies all commits atomically and returns the new pointers
@@ -58,9 +65,10 @@ type Store interface {
 	// RenameTable moves a table to a new identifier, possibly in another
 	// namespace. The target must not be taken by a table or a view.
 	RenameTable(ctx context.Context, from, to Ident) error
-	// DropTable removes the pointer of a table. Metadata and data files are
-	// left untouched.
-	DropTable(ctx context.Context, id Ident) error
+	// DropTable removes the pointer of a table and returns the pointer it
+	// removed. Metadata and data files are left untouched; with opts.Purge, a
+	// [PurgeTask] for them is enqueued in the same atomic write.
+	DropTable(ctx context.Context, id Ident, opts DropOptions) (Pointer, error)
 
 	// GetView returns the pointer of a view.
 	GetView(ctx context.Context, id Ident) (Pointer, error)
@@ -74,4 +82,16 @@ type Store interface {
 	RenameView(ctx context.Context, from, to Ident) error
 	// DropView removes the pointer of a view.
 	DropView(ctx context.Context, id Ident) error
+
+	// ListPurgeTasks returns up to limit queued purge tasks, claimed or not,
+	// oldest first.
+	ListPurgeTasks(ctx context.Context, limit int) ([]PurgeTask, error)
+	// ClaimPurgeTask sets the claim of a task, if the task is still at the
+	// version of task: claiming takes over an expired claim, and claiming
+	// again renews one. It returns the task at its new version, or
+	// [ErrPurgeTaskChanged].
+	ClaimPurgeTask(ctx context.Context, task PurgeTask, claim PurgeClaim) (PurgeTask, error)
+	// CompletePurgeTask removes a task, if it is still at the version of
+	// task, or returns [ErrPurgeTaskChanged].
+	CompletePurgeTask(ctx context.Context, task PurgeTask) error
 }

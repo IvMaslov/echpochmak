@@ -60,7 +60,7 @@ func (s *Server) CreateNamespace(
 	}
 
 	if req.Body == nil {
-		return nil, fmt.Errorf("%w: missing request body", catalog.ErrInvalidRequest)
+		return nil, fmt.Errorf("%w: missing request body", errBadRequest)
 	}
 
 	ns := store.Namespace(req.Body.Namespace)
@@ -129,7 +129,7 @@ func (s *Server) UpdateProperties(
 	}
 
 	if req.Body == nil {
-		return nil, fmt.Errorf("%w: missing request body", catalog.ErrInvalidRequest)
+		return nil, fmt.Errorf("%w: missing request body", errBadRequest)
 	}
 
 	upd := store.PropertiesUpdate{Updates: optionalMap(req.Body.Updates)}

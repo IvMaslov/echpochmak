@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"strings"
 
 	"echpochmak/internal/api/gen"
 	"echpochmak/internal/catalog"
@@ -17,11 +18,16 @@ var (
 	errNotImplemented = errors.New("operation not implemented")
 	// errNotFound is returned for requests to an unknown catalog prefix.
 	errNotFound = errors.New("not found")
+	// errBadRequest is returned for a request that cannot be decoded or lacks
+	// a required part. A well-formed request that Iceberg rejects is a
+	// [catalog.ErrInvalidRequest] instead.
+	errBadRequest = errors.New("invalid request")
 )
 
 // Iceberg error types, as named by the REST spec and expected by clients.
 const (
 	typeBadRequest          = "BadRequestException"
+	typeIllegalArgument     = "IllegalArgumentException"
 	typeNoSuchNamespace     = "NoSuchNamespaceException"
 	typeNoSuchTable         = "NoSuchTableException"
 	typeNoSuchView          = "NoSuchViewException"
@@ -47,7 +53,13 @@ func writeError(w http.ResponseWriter, r *http.Request, err error) {
 		return
 	}
 
-	writeErrorModel(w, r, status, errType, err.Error())
+	msg := err.Error()
+	if errType == typeIllegalArgument {
+		// The message is the validation failure itself, as Java's.
+		msg = strings.TrimPrefix(msg, catalog.ErrInvalidRequest.Error()+": ")
+	}
+
+	writeErrorModel(w, r, status, errType, msg)
 }
 
 // classify maps a known error to its HTTP status and Iceberg error type.
@@ -57,8 +69,12 @@ func classify(err error) (status int, errType string, ok bool) {
 		return http.StatusNotImplemented, typeUnsupported, true
 	case errors.Is(err, errNotFound):
 		return http.StatusNotFound, typeNotFound, true
-	case errors.Is(err, store.ErrInvalidArgument), errors.Is(err, catalog.ErrInvalidRequest):
+	case errors.Is(err, errBadRequest), errors.Is(err, store.ErrInvalidArgument):
 		return http.StatusBadRequest, typeBadRequest, true
+	case errors.Is(err, catalog.ErrInvalidRequest):
+		// Java clients turn this type into an IllegalArgumentException, as
+		// they do for the reference server's validation failures.
+		return http.StatusBadRequest, typeIllegalArgument, true
 	case errors.Is(err, catalog.ErrPropertyConflict):
 		return http.StatusUnprocessableEntity, typeUnprocessable, true
 	case errors.Is(err, catalog.ErrRequirementFailed):

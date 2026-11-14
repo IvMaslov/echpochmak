@@ -1,8 +1,9 @@
 //go:build ha
 
-// Package ha is the Phase 3 milestone: Trino and PyIceberg write through
-// two catalog replicas on the raft store while catalog replicas and the
-// raft leader are killed and restarted. Run it with make ha-e2e, which
+// Package ha is the Phase 3 milestone, extended in Phase 4: Trino and
+// PyIceberg write through two catalog replicas on the raft store while
+// catalog replicas and the raft leader are killed and restarted, and
+// multi-table transactions and purges survive the same faults. Run it with make ha-e2e, which
 // starts the HA stack and removes it afterwards.
 //
 // Every scenario checks that each acknowledged row is present exactly once,
@@ -511,6 +512,18 @@ func TestHA(t *testing.T) {
 		s := s.in(t)
 
 		testIdempotentRetry(t, s)
+	})
+
+	t.Run("7 two-table transactions under faults", func(t *testing.T) {
+		s := s.in(t)
+
+		testTransactionsUnderFaults(t, s)
+	})
+
+	t.Run("8 purge finished by the other replica", func(t *testing.T) {
+		s := s.in(t)
+
+		testPurgeAcrossReplicas(t, s)
 	})
 }
 

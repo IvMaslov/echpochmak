@@ -32,6 +32,14 @@ IMAGE   := echpochmak/catalog-server
 # Network for `docker build`; see BUILD_NETWORK in deployments/compose/.env.example.
 BUILD_NETWORK ?= default
 
+# Swagger UI, vendored into internal/api/swaggerui/dist and embedded. Bump both
+# values (the integrity is the npm registry's dist.integrity) and run
+# `make swagger-ui-update`.
+SWAGGER_UI_VERSION   ?= 5.34.1
+SWAGGER_UI_INTEGRITY ?= sha512-VSr8fXfI93obYaQicLJbLUKGRxDojj/SfRJDDLCioGTUBj4BK/Nj4eE9jCeCAnJxVLi7iS+08PbiZLyrQKBkJQ==
+SWAGGER_UI_DIR       := internal/api/swaggerui/dist
+SWAGGER_UI_FILES     := swagger-ui-bundle.js swagger-ui-bundle.js.LICENSE.txt swagger-ui.css favicon-32x32.png LICENSE NOTICE
+
 COVER_PROFILE := coverage.out
 
 ##@ General
@@ -56,6 +64,18 @@ spec-update: ## Download the Iceberg REST spec at SPEC_COMMIT
 	printf 'source: %s\ncommit: %s\ndownloaded: %s\n' "$(SPEC_URL)" "$(SPEC_COMMIT)" "$$(date -u +%Y-%m-%d)" \
 		> $(SPEC_DIR)/SPEC_VERSION
 	@echo "Spec updated; run 'make generate' and review the diff."
+
+.PHONY: swagger-ui-update
+swagger-ui-update: ## Download swagger-ui-dist at SWAGGER_UI_VERSION, check its integrity and vendor it
+	tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
+		curl -fsSLo "$$tmp/pkg.tgz" https://registry.npmjs.org/swagger-ui-dist/-/swagger-ui-dist-$(SWAGGER_UI_VERSION).tgz; \
+		got="sha512-$$(openssl dgst -sha512 -binary "$$tmp/pkg.tgz" | base64 -w0)"; \
+		[ "$$got" = "$(SWAGGER_UI_INTEGRITY)" ] || { echo "integrity mismatch: $$got" >&2; exit 1; }; \
+		tar -xzf "$$tmp/pkg.tgz" -C "$$tmp"; \
+		rm -rf $(SWAGGER_UI_DIR); mkdir -p $(SWAGGER_UI_DIR); \
+		for f in $(SWAGGER_UI_FILES); do cp "$$tmp/package/$$f" $(SWAGGER_UI_DIR)/; done; \
+		printf 'swagger-ui-dist %s\nsource: https://registry.npmjs.org/swagger-ui-dist/-/swagger-ui-dist-%s.tgz\nintegrity: %s\nfiles: %s\nupdate with: make swagger-ui-update SWAGGER_UI_VERSION=<version> SWAGGER_UI_INTEGRITY=<sha512-...>\n' \
+			$(SWAGGER_UI_VERSION) $(SWAGGER_UI_VERSION) $(SWAGGER_UI_INTEGRITY) "$(SWAGGER_UI_FILES)" > $(SWAGGER_UI_DIR)/VERSION
 
 .PHONY: generate
 generate: ## Regenerate code (go generate ./...)
@@ -144,6 +164,30 @@ ha-e2e: deployments/compose/.env ## Run the HA milestone suite and the Trino sui
 		[ $$status -ne 0 ] || go test -tags e2e -count=1 -v ./test/e2e/ || status=$$?; \
 		$(HA_COMPOSE) down -v --remove-orphans; \
 		exit $$status
+
+# run-rck runs the REST Compatibility Kit on the stack that $(1) starts with
+# the services $(2), copies the reports to build/rck-reports/$(3) and removes
+# the stack, whatever the result.
+define run-rck
+	$(1) up -d --build --wait $(2)
+	status=0; \
+		$(1) --profile rck run --build --name echpochmak-rck rck || status=$$?; \
+		rm -rf build/rck-reports/$(3); mkdir -p build/rck-reports/$(3); \
+		docker cp echpochmak-rck:/rck/open-api/build/test-results/test build/rck-reports/$(3)/xml >/dev/null 2>&1 || true; \
+		docker cp echpochmak-rck:/rck/open-api/build/reports/tests/test build/rck-reports/$(3)/html >/dev/null 2>&1 || true; \
+		docker rm -f echpochmak-rck >/dev/null 2>&1 || true; \
+		$(1) --profile rck down -v --remove-orphans; \
+		echo "RCK reports: build/rck-reports/$(3)/html/index.html"; \
+		exit $$status
+endef
+
+.PHONY: rck
+rck: deployments/compose/.env ## Optional: run Iceberg's REST Compatibility Kit against one in-memory catalog, then remove the stack
+	$(call run-rck,$(COMPOSE),catalog,rck)
+
+.PHONY: rck-ha
+rck-ha: deployments/compose/.env ## Optional: run Iceberg's REST Compatibility Kit against the HA stack, then remove it
+	$(call run-rck,$(HA_COMPOSE),lb,rck-ha)
 
 .PHONY: cover
 cover: ## Run tests with coverage and write an HTML report

@@ -87,6 +87,11 @@ func run() error {
 
 	guard := newGuard(ctx, cfg, b.records, log)
 
+	// The purger reads each file once; it must not evict table metadata from
+	// the cache.
+	purger := startPurger(ctx, cfg.Catalog, b.store, fileio.NewIceberg(storageCtx, cfg.S3.IOProps()), log)
+	defer purger.wait()
+
 	serverOpts := []api.ServerOption{}
 	if guard != nil {
 		serverOpts = append(serverOpts, api.WithIdempotencyLifetime(guard.Lifetime()))
@@ -103,6 +108,7 @@ func run() error {
 			Server:       api.NewServer(svc, cfg.Catalog.Name, serverOpts...),
 			MaxBodyBytes: cfg.HTTP.MaxBodyBytes,
 			Idempotency:  guard,
+			Docs:         cfg.HTTP.Docs,
 		}),
 		ReadHeaderTimeout: cfg.HTTP.ReadHeaderTimeout,
 		ReadTimeout:       cfg.HTTP.ReadTimeout,
@@ -195,6 +201,58 @@ func newBackend(cfg config.Store, log *slog.Logger) (backend, error) {
 	default:
 		return backend{}, fmt.Errorf("unsupported store backend %q", cfg.Backend)
 	}
+}
+
+// runningPurger is the purge worker of this replica, if it runs one.
+type runningPurger struct {
+	done chan struct{}
+}
+
+// wait blocks until the purger has stopped, after its context is done.
+func (p runningPurger) wait() {
+	if p.done != nil {
+		<-p.done
+	}
+}
+
+// startPurger runs the purge worker until ctx is done, unless purge-workers
+// is zero.
+func startPurger(
+	ctx context.Context,
+	cfg config.Catalog,
+	st store.Store,
+	files fileio.FileIO,
+	log *slog.Logger,
+) runningPurger {
+	if cfg.PurgeWorkers == 0 {
+		log.InfoContext(ctx, "purge worker disabled; other replicas purge dropped tables")
+
+		return runningPurger{}
+	}
+
+	host, err := os.Hostname()
+	if err != nil {
+		host = "unknown"
+	}
+
+	p := catalog.NewPurger(catalog.PurgerOptions{
+		Store:    st,
+		Files:    files,
+		Owner:    fmt.Sprintf("%s/%d", host, os.Getpid()),
+		Workers:  cfg.PurgeWorkers,
+		Lease:    cfg.PurgeLease,
+		Interval: cfg.PurgeInterval,
+		Logger:   log,
+	})
+
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+		p.Run(ctx)
+	}()
+
+	return runningPurger{done: done}
 }
 
 // janitorInterval is how often expired idempotency records are deleted.

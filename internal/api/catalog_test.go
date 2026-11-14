@@ -417,7 +417,7 @@ func TestCommitErrors(t *testing.T) {
 			target:  "/v1/main/namespaces/db/tables/t",
 			body:    `{"requirements":[],"updates":[{"action":"set-current-schema","schema-id":9}]}`,
 			status:  http.StatusBadRequest,
-			errType: "BadRequestException",
+			errType: "IllegalArgumentException",
 		},
 		{
 			name:    "unknown update action",
@@ -463,17 +463,34 @@ func TestCreateTableErrors(t *testing.T) {
 	c := newClient(t)
 	c.expect(http.StatusOK, http.MethodPost, "/v1/main/namespaces", `{"namespace":["db"]}`, nil)
 
-	for name, body := range map[string]string{
-		"no schema":  `{"name":"t"}`,
-		"bad schema": `{"name":"t","schema":{"type":"struct","fields":[{"id":1,"name":"x","type":"nope"}]}}`,
-		"bad partitioning": `{"name":"t","schema":{"type":"struct","fields":[]},
-			"partition-spec":{"fields":[{"name":"p","transform":"identity","source-id":7}]}}`,
-		"empty name": `{"name":"","schema":{"type":"struct","fields":[]}}`,
-	} {
-		t.Run(name, func(t *testing.T) {
+	// A malformed request is a BadRequestException; a well-formed one that
+	// Iceberg rejects is an IllegalArgumentException, as from Java's server.
+	tests := []struct {
+		name, body, errType string
+	}{
+		{name: "no schema", body: `{"name":"t"}`, errType: "BadRequestException"},
+		{
+			name:    "bad schema",
+			body:    `{"name":"t","schema":{"type":"struct","fields":[{"id":1,"name":"x","type":"nope"}]}}`,
+			errType: "BadRequestException",
+		},
+		{
+			name: "bad partitioning",
+			body: `{"name":"t","schema":{"type":"struct","fields":[]},
+				"partition-spec":{"fields":[{"name":"p","transform":"identity","source-id":7}]}}`,
+			errType: "IllegalArgumentException",
+		},
+		{
+			name:    "empty name",
+			body:    `{"name":"","schema":{"type":"struct","fields":[]}}`,
+			errType: "BadRequestException",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			c.expectError(http.StatusBadRequest, "BadRequestException", http.MethodPost,
-				"/v1/main/namespaces/db/tables", body)
+			c.expectError(http.StatusBadRequest, tt.errType, http.MethodPost, "/v1/main/namespaces/db/tables", tt.body)
 		})
 	}
 }

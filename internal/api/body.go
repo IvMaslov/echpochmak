@@ -8,8 +8,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-
-	"echpochmak/internal/catalog"
 )
 
 type rawBodyKey struct{}
@@ -52,11 +50,11 @@ func withRawBody(maxBytes int64, next http.Handler) http.Handler {
 func decodeRawBody(ctx context.Context, v any) error {
 	body, ok := ctx.Value(rawBodyKey{}).([]byte)
 	if !ok || len(body) == 0 {
-		return fmt.Errorf("%w: missing request body", catalog.ErrInvalidRequest)
+		return fmt.Errorf("%w: missing request body", errBadRequest)
 	}
 
 	if err := json.Unmarshal(body, v); err != nil {
-		return fmt.Errorf("%w: decoding request body: %w", catalog.ErrInvalidRequest, err)
+		return fmt.Errorf("%w: decoding request body: %w", errBadRequest, err)
 	}
 
 	return nil

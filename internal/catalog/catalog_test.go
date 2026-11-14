@@ -608,9 +608,14 @@ func TestRenameAndDropTable(t *testing.T) {
 		t.Fatalf("TableExists after drop = %v", err)
 	}
 
-	// Purge is not implemented: files stay.
+	// The drop only queues the purge; a purge worker deletes the files.
 	if !slices.Contains(f.files.list(), created.MetadataLocation) {
 		t.Fatal("drop deleted metadata files")
+	}
+
+	tasks, err := f.store.ListPurgeTasks(ctx, 10)
+	if err != nil || len(tasks) != 1 || tasks[0].MetadataLocation != created.MetadataLocation {
+		t.Fatalf("purge tasks = %+v (%v), want one for %q", tasks, err, created.MetadataLocation)
 	}
 
 	if err := f.svc.ReportMetrics(ctx, ident("renamed"), "scan-report"); !errors.Is(err, store.ErrTableNotFound) {

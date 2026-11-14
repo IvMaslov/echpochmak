@@ -47,9 +47,134 @@ func (s *Store) RenameTable(ctx context.Context, from, to store.Ident) error {
 	return s.rename(ctx, tables, from, to)
 }
 
-// DropTable implements [store.Store].
-func (s *Store) DropTable(ctx context.Context, id store.Ident) error {
-	return s.drop(ctx, tables, id)
+// GetTables implements [store.Store]: one read-only transaction, so every
+// pointer is read at the same revision.
+func (s *Store) GetTables(ctx context.Context, ids []store.Ident) ([]store.Pointer, error) {
+	if err := checkCtx(ctx); err != nil {
+		return nil, err
+	}
+
+	if err := validateIdents(ids); err != nil {
+		return nil, err
+	}
+
+	req := &kvpb.TxnRequest{Success: make([]*kvpb.RequestOp, 0, len(ids))}
+	for _, id := range ids {
+		req.Success = append(req.Success, read(s.pointerKey(tables, id)))
+	}
+
+	resp, err := s.txn(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+
+	ptrs := make([]store.Pointer, 0, len(ids))
+
+	for i, id := range ids {
+		kv := readResult(resp, i)
+		if kv == nil {
+			ptrs = append(ptrs, store.Pointer{Ident: cloneIdent(id)})
+
+			continue
+		}
+
+		p, err := pointer(id, kv)
+		if err != nil {
+			return nil, err
+		}
+
+		ptrs = append(ptrs, p)
+	}
+
+	return ptrs, nil
+}
+
+// DropTable implements [store.Store]. The pointer returned is exactly the one
+// removed: a plain drop reads and deletes the key in one transaction, and a
+// drop with purge deletes it at the revision it read, so the purge task names
+// the table's final metadata file.
+func (s *Store) DropTable(ctx context.Context, id store.Ident, opts store.DropOptions) (store.Pointer, error) {
+	if err := checkCtx(ctx); err != nil {
+		return store.Pointer{}, err
+	}
+
+	if err := id.Validate(); err != nil {
+		return store.Pointer{}, err
+	}
+
+	if opts.Purge {
+		return s.dropAndPurge(ctx, id)
+	}
+
+	key := s.pointerKey(tables, id)
+
+	resp, err := s.txn(ctx, &kvpb.TxnRequest{
+		Compare: []*kvpb.Compare{present(key)},
+		Success: []*kvpb.RequestOp{read(key), client.OpDelete(key, nil)},
+	})
+	if err != nil {
+		return store.Pointer{}, err
+	}
+
+	if !resp.GetSucceeded() {
+		return store.Pointer{}, fmt.Errorf("%w: %s", store.ErrTableNotFound, id.String())
+	}
+
+	return pointer(id, readResult(resp, 0))
+}
+
+// dropAndPurge drops a table and enqueues its purge task in one transaction.
+// The task's value must hold the metadata location, so the pointer is read
+// first and deleted only at that revision; a concurrent commit makes it
+// retry.
+func (s *Store) dropAndPurge(ctx context.Context, id store.Ident) (store.Pointer, error) {
+	key := s.pointerKey(tables, id)
+
+	for attempt := range casRetries {
+		kv, err := s.get(ctx, key)
+		if err != nil {
+			return store.Pointer{}, err
+		}
+
+		if kv == nil {
+			return store.Pointer{}, fmt.Errorf("%w: %s", store.ErrTableNotFound, id.String())
+		}
+
+		ptr, err := pointer(id, kv)
+		if err != nil {
+			return store.Pointer{}, err
+		}
+
+		task, err := s.newPurgeTask(ptr)
+		if err != nil {
+			return store.Pointer{}, err
+		}
+
+		resp, err := s.txn(ctx, &kvpb.TxnRequest{
+			Compare: []*kvpb.Compare{atRevision(key, kv.GetModRevision())},
+			Success: []*kvpb.RequestOp{client.OpDelete(key, nil), task},
+		})
+		if err != nil {
+			return store.Pointer{}, err
+		}
+
+		if resp.GetSucceeded() {
+			return ptr, nil
+		}
+
+		// A concurrent commit won: wait a little, so a busy table lets the
+		// drop through, and read it again.
+		if err := pause(ctx, attempt); err != nil {
+			return store.Pointer{}, err
+		}
+	}
+
+	return store.Pointer{}, fmt.Errorf(
+		"%w: %q changed concurrently %d times",
+		store.ErrUnavailable,
+		id.String(),
+		casRetries,
+	)
 }
 
 // GetView implements [store.Store].
@@ -105,7 +230,7 @@ func (s *Store) getPointer(ctx context.Context, kind pointerKind, id store.Ident
 	}
 
 	if kv == nil {
-		return store.Pointer{}, fmt.Errorf("%w: %q", kind.errNotFound, id.String())
+		return store.Pointer{}, fmt.Errorf("%w: %s", kind.errNotFound, id.String())
 	}
 
 	return pointer(id, kv)
@@ -144,7 +269,7 @@ func (s *Store) listPointers(
 	}
 
 	if page == nil {
-		return store.Page[store.Ident]{}, fmt.Errorf("%w: %q", store.ErrNamespaceNotFound, ns.String())
+		return store.Page[store.Ident]{}, fmt.Errorf("%w: %s", store.ErrNamespaceNotFound, ns.String())
 	}
 
 	out := store.Page[store.Ident]{Items: make([]store.Ident, 0, len(page.names)), NextToken: page.next}
@@ -154,14 +279,6 @@ func (s *Store) listPointers(
 
 	return out, nil
 }
-
-// Reads in the failure branch of a commit, per commit, in this order.
-const (
-	readTable = iota
-	readView
-	readNamespace
-	readsPerCommit
-)
 
 // commit swaps pointers of one kind in one transaction. Each commit's
 // precondition is a compare; the failure branch reads every key involved, so
@@ -180,14 +297,22 @@ func (s *Store) commit(ctx context.Context, kind pointerKind, commits []store.Co
 	for _, c := range commits {
 		key := s.pointerKey(kind, c.Ident)
 
+		// The failure branch reads the keys the compares check, in the same
+		// order; commitFailure relies on it.
 		if c.IsCreate() {
 			req.Compare = append(req.Compare,
 				absent(s.pointerKey(tables, c.Ident)),
 				absent(s.pointerKey(views, c.Ident)),
 				present(s.k.namespace(c.Ident.Namespace)),
 			)
+			req.Failure = append(req.Failure,
+				read(s.pointerKey(tables, c.Ident)),
+				read(s.pointerKey(views, c.Ident)),
+				read(s.k.namespace(c.Ident.Namespace)),
+			)
 		} else {
 			req.Compare = append(req.Compare, atRevision(key, int64(c.ExpectedVersion)))
+			req.Failure = append(req.Failure, read(key))
 		}
 
 		value, err := encode(pointerValue{MetadataLocation: c.MetadataLocation})
@@ -196,11 +321,6 @@ func (s *Store) commit(ctx context.Context, kind pointerKind, commits []store.Co
 		}
 
 		req.Success = append(req.Success, client.OpPut(key, value))
-		req.Failure = append(req.Failure,
-			read(s.pointerKey(tables, c.Ident)),
-			read(s.pointerKey(views, c.Ident)),
-			read(s.k.namespace(c.Ident.Namespace)),
-		)
 	}
 
 	resp, err := s.txn(ctx, req)
@@ -229,32 +349,33 @@ func (s *Store) commit(ctx context.Context, kind pointerKind, commits []store.Co
 // commitFailure finds the first commit, in order, whose precondition did not
 // hold, from the keys read by the failure branch.
 func commitFailure(kind pointerKind, commits []store.Commit, resp *kvpb.TxnResponse) error {
-	for i, c := range commits {
-		base := i * readsPerCommit
-		table := readResult(resp, base+readTable)
-		view := readResult(resp, base+readView)
+	next := 0
 
+	for _, c := range commits {
 		if c.IsCreate() {
+			table := readResult(resp, next)
+			view := readResult(resp, next+1)
+			ns := readResult(resp, next+2)
+			next += createCost
+
 			switch {
-			case readResult(resp, base+readNamespace) == nil:
-				return fmt.Errorf("%w: %q", store.ErrNamespaceNotFound, c.Ident.Namespace.String())
+			case ns == nil:
+				return fmt.Errorf("%w: %s", store.ErrNamespaceNotFound, c.Ident.Namespace.String())
 			case table != nil:
-				return fmt.Errorf("%w: %q", store.ErrTableAlreadyExists, c.Ident.String())
+				return fmt.Errorf("%w: %s", store.ErrTableAlreadyExists, c.Ident.String())
 			case view != nil:
-				return fmt.Errorf("%w: %q", store.ErrViewAlreadyExists, c.Ident.String())
+				return fmt.Errorf("%w: %s", store.ErrViewAlreadyExists, c.Ident.String())
 			}
 
 			continue
 		}
 
-		own := table
-		if kind.space == spaceViews {
-			own = view
-		}
+		own := readResult(resp, next)
+		next += updateCost
 
 		switch {
 		case own == nil:
-			return fmt.Errorf("%w: %q", kind.errNotFound, c.Ident.String())
+			return fmt.Errorf("%w: %s", kind.errNotFound, c.Ident.String())
 		case store.Version(own.GetModRevision()) != c.ExpectedVersion:
 			return &store.CommitConflictError{
 				Ident:    cloneIdent(c.Ident),
@@ -294,7 +415,7 @@ func (s *Store) rename(ctx context.Context, kind pointerKind, from, to store.Ide
 		}
 
 		if src == nil {
-			return fmt.Errorf("%w: %q", kind.errNotFound, from.String())
+			return fmt.Errorf("%w: %s", kind.errNotFound, from.String())
 		}
 
 		resp, err := s.txn(ctx, &kvpb.TxnRequest{
@@ -323,13 +444,13 @@ func (s *Store) rename(ctx context.Context, kind pointerKind, from, to store.Ide
 		case resp.GetSucceeded():
 			return nil
 		case readResult(resp, 0) == nil:
-			return fmt.Errorf("%w: %q", kind.errNotFound, from.String())
+			return fmt.Errorf("%w: %s", kind.errNotFound, from.String())
 		case readResult(resp, 1) == nil:
-			return fmt.Errorf("%w: %q", store.ErrNamespaceNotFound, to.Namespace.String())
+			return fmt.Errorf("%w: %s", store.ErrNamespaceNotFound, to.Namespace.String())
 		case readResult(resp, 2) != nil:
-			return fmt.Errorf("%w: %q", store.ErrTableAlreadyExists, to.String())
+			return fmt.Errorf("%w: %s", store.ErrTableAlreadyExists, to.String())
 		case readResult(resp, 3) != nil:
-			return fmt.Errorf("%w: %q", store.ErrViewAlreadyExists, to.String())
+			return fmt.Errorf("%w: %s", store.ErrViewAlreadyExists, to.String())
 		}
 		// Only the source changed, under a concurrent commit: try again.
 	}
@@ -337,6 +458,7 @@ func (s *Store) rename(ctx context.Context, kind pointerKind, from, to store.Ide
 	return fmt.Errorf("%w: %q changed concurrently %d times", store.ErrUnavailable, from.String(), casRetries)
 }
 
+// drop deletes a pointer that exists, whatever its revision.
 func (s *Store) drop(ctx context.Context, kind pointerKind, id store.Ident) error {
 	if err := checkCtx(ctx); err != nil {
 		return err
@@ -357,7 +479,7 @@ func (s *Store) drop(ctx context.Context, kind pointerKind, id store.Ident) erro
 	}
 
 	if !resp.GetSucceeded() {
-		return fmt.Errorf("%w: %q", kind.errNotFound, id.String())
+		return fmt.Errorf("%w: %s", kind.errNotFound, id.String())
 	}
 
 	return nil
@@ -368,21 +490,63 @@ func validateCommits(commits []store.Commit) error {
 		return fmt.Errorf("%w: no commits", store.ErrInvalidArgument)
 	}
 
-	if len(commits) > MaxCommitsPerTxn {
-		return fmt.Errorf("%w: %d commits exceed the limit of %d per transaction",
-			store.ErrInvalidArgument, len(commits), MaxCommitsPerTxn)
-	}
-
 	seen := make(map[string]bool, len(commits))
+	cost := 0
 
 	for _, c := range commits {
 		if err := c.Validate(); err != nil {
 			return err
 		}
 
+		cost += updateCost
+		if c.IsCreate() {
+			cost += createCost - updateCost
+		}
+
 		key := c.Ident.Namespace.Child(c.Ident.Name).Encode()
 		if seen[key] {
 			return fmt.Errorf("%w: duplicate commit for %q", store.ErrInvalidArgument, c.Ident.String())
+		}
+
+		seen[key] = true
+	}
+
+	if cost > TxnBudget {
+		return fmt.Errorf(
+			"%w: the transaction is too large: it costs %d of %d (an update costs %d, a create %d)",
+			store.ErrInvalidArgument,
+			cost,
+			TxnBudget,
+			updateCost,
+			createCost,
+		)
+	}
+
+	return nil
+}
+
+// validateIdents checks the identifiers of a batch read: valid, none twice,
+// and few enough for one transaction.
+func validateIdents(ids []store.Ident) error {
+	if len(ids) > TxnBudget {
+		return fmt.Errorf(
+			"%w: %d tables exceed the limit of %d per read",
+			store.ErrInvalidArgument,
+			len(ids),
+			TxnBudget,
+		)
+	}
+
+	seen := make(map[string]bool, len(ids))
+
+	for _, id := range ids {
+		if err := id.Validate(); err != nil {
+			return err
+		}
+
+		key := id.Namespace.Child(id.Name).Encode()
+		if seen[key] {
+			return fmt.Errorf("%w: %q requested twice", store.ErrInvalidArgument, id.String())
 		}
 
 		seen[key] = true

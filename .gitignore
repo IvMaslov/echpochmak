@@ -7,6 +7,7 @@ arch/prompt.md
 # Test output
 coverage.out
 coverage.html
+/build/rck-reports/
 
 # Local environment
 deployments/compose/.env

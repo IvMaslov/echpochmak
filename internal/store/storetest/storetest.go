@@ -38,6 +38,9 @@ func Run(t *testing.T, newStore Factory) {
 	t.Run("Isolation", func(t *testing.T) { testIsolation(t, newStore) })
 	t.Run("CancelledContext", func(t *testing.T) { testCancelledContext(t, newStore) })
 	t.Run("InvalidArguments", func(t *testing.T) { testInvalidArguments(t, newStore) })
+	t.Run("GetTables", func(t *testing.T) { testGetTables(t, newStore) })
+	t.Run("DropTable", func(t *testing.T) { testDropTable(t, newStore) })
+	t.Run("PurgeQueue", func(t *testing.T) { testPurgeQueue(t, newStore) })
 }
 
 func testNamespaces(t *testing.T, newStore Factory) {
@@ -385,7 +388,9 @@ func tableOps() pointerOps {
 			return s.RenameTable(ctx, from, to)
 		},
 		drop: func(ctx context.Context, s store.Store, id store.Ident) error {
-			return s.DropTable(ctx, id)
+			_, err := s.DropTable(ctx, id, store.DropOptions{})
+
+			return err
 		},
 	}
 }
@@ -834,6 +839,9 @@ func testCancelledContext(t *testing.T, newStore Factory) {
 	_, calls["CommitTables"] = s.CommitTables(ctx, []store.Commit{
 		{Ident: ident("db", "t"), MetadataLocation: "s3://w/1.json"},
 	})
+	_, calls["GetTables"] = s.GetTables(ctx, []store.Ident{ident("db", "t")})
+	_, calls["DropTable"] = s.DropTable(ctx, ident("db", "t"), store.DropOptions{Purge: true})
+	_, calls["ListPurgeTasks"] = s.ListPurgeTasks(ctx, 10)
 
 	for name, err := range calls {
 		if !errors.Is(err, context.Canceled) {
@@ -869,6 +877,16 @@ func testInvalidArguments(t *testing.T, newStore Factory) {
 		}},
 		{name: "empty metadata location", call: func() error {
 			_, err := s.CommitTables(ctx, []store.Commit{{Ident: ident("db", "t")}})
+
+			return err
+		}},
+		{name: "duplicate table in a batch read", call: func() error {
+			_, err := s.GetTables(ctx, []store.Ident{ident("db", "t"), ident("db", "t")})
+
+			return err
+		}},
+		{name: "non-positive purge task limit", call: func() error {
+			_, err := s.ListPurgeTasks(ctx, 0)
 
 			return err
 		}},

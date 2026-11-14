@@ -31,22 +31,6 @@ func (*Server) LoadFunction(
 	return nil, errNotImplemented
 }
 
-// RegisterTable implements [gen.StrictServerInterface].
-func (*Server) RegisterTable(
-	context.Context,
-	gen.RegisterTableRequestObject,
-) (gen.RegisterTableResponseObject, error) {
-	return nil, errNotImplemented
-}
-
-// RegisterView implements [gen.StrictServerInterface].
-func (*Server) RegisterView(
-	context.Context,
-	gen.RegisterViewRequestObject,
-) (gen.RegisterViewResponseObject, error) {
-	return nil, errNotImplemented
-}
-
 // LoadCredentials implements [gen.StrictServerInterface].
 func (*Server) LoadCredentials(
 	context.Context,
@@ -89,56 +73,5 @@ func (*Server) FetchScanTasks(
 	context.Context,
 	gen.FetchScanTasksRequestObject,
 ) (gen.FetchScanTasksResponseObject, error) {
-	return nil, errNotImplemented
-}
-
-// UnregisterTable implements [gen.StrictServerInterface].
-func (*Server) UnregisterTable(
-	context.Context,
-	gen.UnregisterTableRequestObject,
-) (gen.UnregisterTableResponseObject, error) {
-	return nil, errNotImplemented
-}
-
-// ListViews implements [gen.StrictServerInterface].
-func (*Server) ListViews(context.Context, gen.ListViewsRequestObject) (gen.ListViewsResponseObject, error) {
-	return nil, errNotImplemented
-}
-
-// CreateView implements [gen.StrictServerInterface].
-func (*Server) CreateView(context.Context, gen.CreateViewRequestObject) (gen.CreateViewResponseObject, error) {
-	return nil, errNotImplemented
-}
-
-// DropView implements [gen.StrictServerInterface].
-func (*Server) DropView(context.Context, gen.DropViewRequestObject) (gen.DropViewResponseObject, error) {
-	return nil, errNotImplemented
-}
-
-// LoadView implements [gen.StrictServerInterface].
-func (*Server) LoadView(context.Context, gen.LoadViewRequestObject) (gen.LoadViewResponseObject, error) {
-	return nil, errNotImplemented
-}
-
-// ViewExists implements [gen.StrictServerInterface].
-func (*Server) ViewExists(context.Context, gen.ViewExistsRequestObject) (gen.ViewExistsResponseObject, error) {
-	return nil, errNotImplemented
-}
-
-// ReplaceView implements [gen.StrictServerInterface].
-func (*Server) ReplaceView(context.Context, gen.ReplaceViewRequestObject) (gen.ReplaceViewResponseObject, error) {
-	return nil, errNotImplemented
-}
-
-// CommitTransaction implements [gen.StrictServerInterface].
-func (*Server) CommitTransaction(
-	context.Context,
-	gen.CommitTransactionRequestObject,
-) (gen.CommitTransactionResponseObject, error) {
-	return nil, errNotImplemented
-}
-
-// RenameView implements [gen.StrictServerInterface].
-func (*Server) RenameView(context.Context, gen.RenameViewRequestObject) (gen.RenameViewResponseObject, error) {
 	return nil, errNotImplemented
 }

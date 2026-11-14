@@ -54,9 +54,9 @@ func (s *Store) CreateNamespace(ctx context.Context, ns store.Namespace, props m
 	case resp.GetSucceeded():
 		return nil
 	case readResult(resp, 0) != nil:
-		return fmt.Errorf("%w: %q", store.ErrNamespaceAlreadyExists, ns.String())
+		return fmt.Errorf("%w: %s", store.ErrNamespaceAlreadyExists, ns.String())
 	default:
-		return fmt.Errorf("%w: %q", store.ErrNamespaceNotFound, ns.Parent().String())
+		return fmt.Errorf("%w: %s", store.ErrNamespaceNotFound, ns.Parent().String())
 	}
 }
 
@@ -76,7 +76,7 @@ func (s *Store) GetNamespace(ctx context.Context, ns store.Namespace) (store.Nam
 	}
 
 	if kv == nil {
-		return store.NamespaceRecord{}, fmt.Errorf("%w: %q", store.ErrNamespaceNotFound, ns.String())
+		return store.NamespaceRecord{}, fmt.Errorf("%w: %s", store.ErrNamespaceNotFound, ns.String())
 	}
 
 	return namespaceRecord(ns, kv)
@@ -126,7 +126,7 @@ func (s *Store) ListNamespaces(
 	}
 
 	if page == nil {
-		return store.Page[store.Namespace]{}, fmt.Errorf("%w: %q", store.ErrNamespaceNotFound, parent.String())
+		return store.Page[store.Namespace]{}, fmt.Errorf("%w: %s", store.ErrNamespaceNotFound, parent.String())
 	}
 
 	out := store.Page[store.Namespace]{Items: make([]store.Namespace, 0, len(page.names)), NextToken: page.next}
@@ -166,7 +166,7 @@ func (s *Store) UpdateNamespaceProperties(
 		}
 
 		if kv == nil {
-			return store.PropertiesUpdateResult{}, fmt.Errorf("%w: %q", store.ErrNamespaceNotFound, ns.String())
+			return store.PropertiesUpdateResult{}, fmt.Errorf("%w: %s", store.ErrNamespaceNotFound, ns.String())
 		}
 
 		rec, err := namespaceRecord(ns, kv)
@@ -265,9 +265,9 @@ func (s *Store) DropNamespace(ctx context.Context, ns store.Namespace) error {
 	case resp.GetSucceeded():
 		return nil
 	case readResult(resp, 0) == nil:
-		return fmt.Errorf("%w: %q", store.ErrNamespaceNotFound, ns.String())
+		return fmt.Errorf("%w: %s", store.ErrNamespaceNotFound, ns.String())
 	default:
-		return fmt.Errorf("%w: %q", store.ErrNamespaceNotEmpty, ns.String())
+		return fmt.Errorf("%w: %s", store.ErrNamespaceNotEmpty, ns.String())
 	}
 }
 

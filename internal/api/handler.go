@@ -43,6 +43,8 @@ type Options struct {
 	// Idempotency, when set, enables the Idempotency-Key protocol for the
 	// mutations in scope.
 	Idempotency *idempotency.Guard
+	// Docs serves the Swagger UI at /docs and the spec at /openapi.json.
+	Docs bool
 }
 
 // NewHandler returns the HTTP handler of the catalog server: the Iceberg REST
@@ -52,6 +54,10 @@ func NewHandler(opts Options) http.Handler {
 
 	mux.HandleFunc("GET "+pathHealthz, handleHealthz)
 	mux.HandleFunc("GET "+pathReadyz, readyzHandler(opts.Ready, opts.Draining))
+	if opts.Docs {
+		mountDocs(mux, opts)
+	}
+
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeErrorModel(w, r, http.StatusNotFound, typeNotFound, "no route for "+r.Method+" "+r.URL.Path)
 	})
@@ -73,7 +79,27 @@ func NewHandler(opts Options) http.Handler {
 	routed := withRoute(mux)
 
 	return withRequestLogging(opts.Logger, withRecovery(withRawBody(maxBody,
-		withIdempotency(opts.Idempotency, mux, routed))))
+		withIdempotency(opts.Idempotency, opts.Server.loadMetadata, mux, routed))))
+}
+
+// mountDocs adds the API documentation routes. They are a convenience, so a
+// failure to build them is logged and the server runs without them.
+func mountDocs(mux *http.ServeMux, opts Options) {
+	docs, err := newDocsHandler(opts.Server.prefix)
+	if err != nil {
+		log := opts.Logger
+		if log == nil {
+			log = slog.Default()
+		}
+
+		log.Error("api docs disabled", logger.Err(err))
+
+		return
+	}
+
+	mux.Handle("GET "+pathDocs, docs)
+	mux.Handle("GET "+pathDocs+"/", docs)
+	mux.Handle("GET "+pathSpec, docs)
 }
 
 // probeResponse is the body of the health and readiness probes.

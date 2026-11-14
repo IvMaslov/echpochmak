@@ -69,6 +69,10 @@ type Response struct {
 	// of this path instead. Responses that carry whole table metadata are too
 	// large to store; the spec allows a replay to show a newer state.
 	ReplayPath string `json:"replay_path,omitempty"`
+	// ReplayMetadata, when set, replaces the stored body for an unregister:
+	// the replay reads the table metadata file at this location again. The
+	// table is gone, so there is nothing to GET.
+	ReplayMetadata string `json:"replay_metadata,omitempty"`
 }
 
 // Finalizes reports whether a response with this status is final, and so

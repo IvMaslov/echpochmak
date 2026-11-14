@@ -6,8 +6,8 @@ server, with catalog state kept in a raft-replicated key-value store.
 - **catalog-server** is a stateless HTTP server implementing the Iceberg REST
   API. Run as many replicas as you like behind a load balancer.
 - **kv-node** is one node of a raft cluster, built on `go.etcd.io/raft/v3`,
-  that will store namespaces and table/view pointers; **kvctl** administers
-  it.
+  that stores namespaces, table and view pointers and the purge queue;
+  **kvctl** administers it.
 - **Store** is the interface between them (`internal/store`). An in-memory
   implementation is used for tests and local development.
 
@@ -17,17 +17,25 @@ Design docs and phase plans are in [`arch/`](arch/).
 
 ## Status
 
-Phases 1–3 are done:
-- Namespaces and tables work end to end with Trino and PyIceberg, against
-  MinIO.
+Phases 1–4 are done:
+- Namespaces, tables and views work end to end with Trino and PyIceberg,
+  against MinIO.
+- Multi-table transactions (`transactions/commit`), register, register-view
+  and unregister are served.
+- `DROP TABLE ... purge` deletes the table's files: a purge worker on every
+  replica works a durable queue in the store.
 - With `-store-backend raft`, the catalog keeps its state in the replicated
   KV cluster (`kv-node`). Any number of stateless catalog replicas can run
   behind a load balancer; they survive losing a replica or the raft leader.
-- `Idempotency-Key` retries are honoured across replicas.
+- `Idempotency-Key` retries are honoured across replicas, for every
+  mutation.
+- Iceberg's own REST Compatibility Kit passes, with a short list of
+  documented exclusions (`test/rck/exclusions.txt`).
+- A Swagger UI at `/docs` shows the served endpoints.
 
-Views, multi-table transactions, register and purge return `501` and are not
-advertised to clients (Phase 4). With the default in-memory backend, catalog
-state is lost on restart.
+Not served, and not advertised to clients: OAuth tokens, credential vending,
+S3 request signing, server-side scan planning and functions. With the default
+in-memory backend, catalog state is lost on restart.
 
 ## Requirements
 
@@ -48,6 +56,8 @@ make kv-chaos      # 3-node KV cluster in docker, linearizability under chaos
 make kv-torture    # longer in-process linearizability run, random seed
 make ha-up         # HA stack: 3 kv-nodes, 2 catalogs behind HAProxy, Trino, PyIceberg
 make ha-e2e        # HA milestone suite under failures, then remove the stack
+make rck           # optional: Iceberg's REST Compatibility Kit, one in-memory catalog
+make rck-ha        # optional: the same against the HA stack
 ```
 
 ## Try it
@@ -66,8 +76,20 @@ SELECT * FROM iceberg.demo.t;
 SELECT * FROM iceberg.demo."t$snapshots";
 ```
 
+```sql
+CREATE VIEW iceberg.demo.v AS SELECT id FROM iceberg.demo.t WHERE id > 1;
+SELECT * FROM iceberg.demo.v;
+DROP TABLE iceberg.demo.t;  -- the catalog purges the table's files
+```
+
 `make e2e` runs the full scenario automatically: CTAS, row-level changes,
-time travel, rename and concurrent inserts.
+time travel, rename, concurrent inserts, views, a multi-table transaction,
+unregister and register, and purge.
+
+The API can also be tried in a browser: the Swagger UI at
+http://localhost:8181/docs lists exactly the operations the server
+implements, with the catalog prefix filled in. Its spec is served at
+`/openapi.json`; `-docs=false` turns both off.
 
 ## Local environment
 
@@ -79,7 +101,7 @@ make compose-down
 
 | Service        | URL                                             |
 |----------------|-------------------------------------------------|
-| catalog-server | http://localhost:8181 (`/healthz`, `/readyz`, `/v1/...`) |
+| catalog-server | http://localhost:8181 (`/healthz`, `/readyz`, `/v1/...`, `/docs`) |
 | MinIO API      | http://localhost:9000                           |
 | MinIO console  | http://localhost:9001 (minioadmin / minioadmin) |
 | Trino          | http://localhost:8080                           |
@@ -153,6 +175,26 @@ replicas and the raft leader, and checks that no acknowledged row is lost or
 duplicated. `make ha-down` removes the stack, its containers and its
 volumes.
 
+## REST Compatibility Kit
+
+The RCK is Iceberg's own test suite for REST servers: Java's `CatalogTests`
+and `ViewCatalogTests`, run through Java's `RESTCatalog`. It checks the
+server against the reference implementation, and is the only independent
+client for register and Java's transaction paths. It is optional: it is not
+part of `make ci`, `make e2e` or `make ha-e2e`.
+
+```sh
+make rck      # against one in-memory catalog
+make rck-ha   # against the HA stack, through HAProxy
+```
+
+Each target builds the `echpochmak/rck:1.12.0` image if it is missing
+(`build/rck/Dockerfile`, Iceberg 1.12.0 on JDK 21, about 7 minutes the first
+time, with `BUILD_NETWORK`), starts a fresh stack, runs the kit, copies the
+reports to `build/rck-reports/<target>/` and removes every container and
+volume. Tests the server deliberately fails are listed with their reasons in
+`test/rck/exclusions.txt`; anything else that fails is a server bug.
+
 ## Configuration
 
 `catalog-server -help` and `kv-node -help` list every flag. Each flag can also be set with an
@@ -174,14 +216,19 @@ Notable settings:
 | `-kv-attempt-timeout` / `-kv-request-timeout` | `2s` / `5s` | One KV attempt / one store call with retries; must nest under `-http-write-timeout` (checked at startup) |
 | `-idempotency-lifetime` | `30m` | How long an `Idempotency-Key` is honoured; `0` disables it |
 | `-http-drain-delay` | `0` | On shutdown, report unready this long before draining; set it to the load balancer's health-check window |
+| `-purge-workers` | `2` | Purge tasks this replica runs at once; `0` leaves them to other replicas |
+| `-purge-lease` / `-purge-interval` | `2m` / `10s` | A purge worker's claim on a task; how often an idle worker scans the queue |
+| `-docs` | `true` | Serve the Swagger UI at `/docs` and the spec at `/openapi.json` |
 
 ## Layout
 
 ```
 cmd/                  binaries (wiring only)
 api/iceberg/          pinned Iceberg OpenAPI spec, overlay, codegen config
-internal/api/         HTTP layer; gen/ holds generated code
-internal/catalog/     catalog operations: create, load and commit tables
+internal/api/         HTTP layer; gen/ holds generated code, swaggerui/ the
+                      vendored Swagger UI
+internal/catalog/     catalog operations: tables, views, transactions,
+                      register, the purge worker
 internal/fileio/      object storage access and the metadata cache
 internal/store/       Store interface, types, errors; storetest/ contract suite
 internal/store/memstore/
@@ -198,6 +245,7 @@ test/conformance/     in-process tests through iceberg-go's REST client
 test/e2e/             Trino end-to-end tests (build tag e2e)
 test/kvchaos/         KV linearizability under docker chaos (build tag kvchaos)
 test/ha/              HA milestone suite (build tag ha), PyIceberg writer
+test/rck/             REST Compatibility Kit exclusions
 build/                Dockerfiles
 deployments/compose/  local environment
 arch/                 design docs, plans, ADRs

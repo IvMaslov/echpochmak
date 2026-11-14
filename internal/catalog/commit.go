@@ -2,9 +2,11 @@ package catalog
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"time"
 
 	"github.com/apache/iceberg-go"
@@ -49,37 +51,59 @@ func (s *Service) CommitTable(ctx context.Context, in CommitInput) (Table, error
 	}
 
 	start := time.Now()
+	entity := slog.String(logger.KeyTable, in.Ident.String())
+
+	t, attempts, err := retryOnRace(ctx, s, entity, func() (Table, error) {
+		return s.commitOnce(ctx, in)
+	})
+	if err != nil {
+		return Table{}, tableNameClash(err, in.Ident)
+	}
+
+	s.logFor(ctx).InfoContext(ctx, "table committed",
+		entity,
+		slog.String(logger.KeyLocation, t.MetadataLocation),
+		slog.Int("updates", len(in.Updates)),
+		slog.Int(logger.KeyAttempt, attempts),
+		slog.Duration(logger.KeyDuration, time.Since(start)),
+	)
+
+	return t, nil
+}
+
+// retryOnRace runs once until it succeeds, fails with an error other than
+// errRetry, or has been retried the configured number of times. It returns
+// the number of attempts made. entity names what is committed, for logs.
+func retryOnRace[T any](ctx context.Context, s *Service, entity slog.Attr, once func() (T, error)) (T, int, error) {
+	var zero T
 
 	for attempt := 0; ; attempt++ {
-		t, err := s.commitOnce(ctx, in)
+		v, err := once()
 		if err == nil {
-			s.logFor(ctx).InfoContext(ctx, "table committed",
-				slog.String(logger.KeyTable, in.Ident.String()),
-				slog.String(logger.KeyLocation, t.MetadataLocation),
-				slog.Int("updates", len(in.Updates)),
-				slog.Int(logger.KeyAttempt, attempt+1),
-				slog.Duration(logger.KeyDuration, time.Since(start)),
-			)
-
-			return t, nil
+			return v, attempt + 1, nil
 		}
 
 		if !errors.Is(err, errRetry) {
-			return Table{}, err
+			return zero, attempt + 1, err
 		}
 
 		if attempt >= s.retries {
-			return Table{}, fmt.Errorf("%w: giving up after %d attempts: %w", store.ErrCommitConflict, attempt+1, err)
+			return zero, attempt + 1, fmt.Errorf(
+				"%w: giving up after %d attempts: %w",
+				store.ErrCommitConflict,
+				attempt+1,
+				err,
+			)
 		}
 
 		s.logFor(ctx).WarnContext(ctx, "commit conflict, retrying",
-			slog.String(logger.KeyTable, in.Ident.String()),
+			entity,
 			slog.Int(logger.KeyAttempt, attempt+1),
 			logger.Err(err),
 		)
 
 		if err := sleep(ctx, s.backoff(attempt+1)); err != nil {
-			return Table{}, err
+			return zero, attempt + 1, err
 		}
 	}
 }
@@ -90,53 +114,87 @@ func (s *Service) commitOnce(ctx context.Context, in CommitInput) (Table, error)
 		return Table{}, err
 	}
 
-	if err := checkRequirements(in.Requirements, current); err != nil {
+	plan, err := planCommit(in, ptr, current)
+	if err != nil {
 		return Table{}, err
 	}
 
-	if current != nil && len(in.Updates) == 0 {
+	if plan == nil {
 		return s.LoadTable(ctx, in.Ident)
+	}
+
+	raw, err := s.writeMetadata(ctx, plan.location, plan.updated)
+	if err != nil {
+		return Table{}, err
+	}
+
+	if _, err := s.store.CommitTables(ctx, []store.Commit{plan.commit()}); err != nil {
+		return Table{}, s.handleFailedPointerWrite(ctx, err, plan.location)
+	}
+
+	s.deleteExpiredMetadata(ctx, current, plan.updated)
+
+	return Table{Ident: in.Ident, MetadataLocation: plan.location, MetadataJSON: raw}, nil
+}
+
+// plannedCommit is a commit whose requirements hold and whose updates are
+// applied, ready for its metadata file to be written and its pointer swapped.
+type plannedCommit struct {
+	ident    store.Ident
+	ptr      store.Pointer
+	current  table.Metadata
+	updated  table.Metadata
+	location string
+}
+
+func (p *plannedCommit) commit() store.Commit {
+	return store.Commit{Ident: p.ident, ExpectedVersion: p.ptr.Version, MetadataLocation: p.location}
+}
+
+// planCommit checks the requirements of in against current, the table's
+// metadata (nil when it does not exist yet, ptr then being zero), and applies
+// the updates. It returns nil if there is nothing to write: the table exists
+// and no updates were requested.
+func planCommit(in CommitInput, ptr store.Pointer, current table.Metadata) (*plannedCommit, error) {
+	if err := checkRequirements(in.Requirements, current); err != nil {
+		return nil, err
+	}
+
+	if current != nil && len(in.Updates) == 0 {
+		return nil, nil //nolint:nilnil // nil means "nothing to commit"; see the doc comment.
 	}
 
 	base := current
 	if base == nil {
-		base, err = emptyMetadata()
+		var err error
+
+		base, err = emptyMetadata(in.Updates)
 		if err != nil {
-			return Table{}, err
+			return nil, err
 		}
 	}
 
 	updated, err := table.UpdateTableMetadata(base, in.Updates, ptr.MetadataLocation)
 	if err != nil {
-		return Table{}, fmt.Errorf("%w: applying updates: %w", ErrInvalidRequest, err)
+		return nil, fmt.Errorf("%w: applying updates: %w", ErrInvalidRequest, err)
 	}
 
 	if updated.Location() == "" {
-		return Table{}, fmt.Errorf("%w: the table has no location; add a set-location update", ErrInvalidRequest)
+		return nil, fmt.Errorf("%w: the table has no location; add a set-location update", ErrInvalidRequest)
 	}
 
 	location, err := newMetadataLocation(updated, current, ptr.MetadataLocation)
 	if err != nil {
-		return Table{}, err
+		return nil, err
 	}
 
-	raw, err := s.writeMetadata(ctx, location, updated)
-	if err != nil {
-		return Table{}, err
-	}
-
-	_, err = s.store.CommitTables(ctx, []store.Commit{{
-		Ident:            in.Ident,
-		ExpectedVersion:  ptr.Version,
-		MetadataLocation: location,
-	}})
-	if err != nil {
-		return Table{}, s.handleFailedPointerWrite(ctx, location, err)
-	}
-
-	s.deleteExpiredMetadata(ctx, current, updated)
-
-	return Table{Ident: in.Ident, MetadataLocation: location, MetadataJSON: raw}, nil
+	return &plannedCommit{
+		ident:    in.Ident,
+		ptr:      ptr,
+		current:  current,
+		updated:  updated,
+		location: location,
+	}, nil
 }
 
 // loadForCommit returns the current pointer and metadata of the table. For a
@@ -159,34 +217,41 @@ func (s *Service) loadForCommit(ctx context.Context, in CommitInput) (store.Poin
 	}
 }
 
-// handleFailedPointerWrite classifies a failed pointer update after a new
-// metadata file was written to location, and cleans up when that is safe.
-func (s *Service) handleFailedPointerWrite(ctx context.Context, location string, err error) error {
+// handleFailedPointerWrite classifies a failed pointer update after new
+// metadata files were written to locations, and cleans up when that is safe.
+func (s *Service) handleFailedPointerWrite(ctx context.Context, err error, locations ...string) error {
 	lostRace := errors.Is(err, store.ErrCommitConflict) ||
 		errors.Is(err, store.ErrTableAlreadyExists) ||
-		errors.Is(err, store.ErrTableNotFound)
+		errors.Is(err, store.ErrTableNotFound) ||
+		errors.Is(err, store.ErrViewNotFound)
 	rejected := errors.Is(err, store.ErrViewAlreadyExists) ||
 		errors.Is(err, store.ErrNamespaceNotFound) ||
 		errors.Is(err, store.ErrInvalidArgument)
 
 	switch {
 	case lostRace:
-		s.deleteFile(ctx, location, "commit lost a race")
+		s.deleteFiles(ctx, locations, "commit lost a race")
 
 		return fmt.Errorf("%w: %w", errRetry, err)
 	case rejected:
-		s.deleteFile(ctx, location, "commit rejected")
+		s.deleteFiles(ctx, locations, "commit rejected")
 
 		return err
 	default:
-		// The pointer may or may not have moved: the new file must stay, and
-		// the client must not clean up either.
+		// The pointers may or may not have moved: the new files must stay,
+		// and the client must not clean up either.
 		s.logFor(ctx).ErrorContext(ctx, "commit state unknown",
-			slog.String(logger.KeyLocation, location),
+			slog.Any("locations", locations),
 			logger.Err(err),
 		)
 
 		return fmt.Errorf("%w: %w", ErrCommitStateUnknown, err)
+	}
+}
+
+func (s *Service) deleteFiles(ctx context.Context, locations []string, reason string) {
+	for _, location := range locations {
+		s.deleteFile(ctx, location, reason)
 	}
 }
 
@@ -207,17 +272,16 @@ func (s *Service) deleteExpiredMetadata(ctx context.Context, before, after table
 }
 
 // checkRequirements validates every requirement against current, which is
-// nil when the table does not exist yet.
+// nil when the table does not exist yet. Only assert-create can hold for a
+// missing table.
 func checkRequirements(reqs []table.Requirement, current table.Metadata) error {
 	for _, req := range reqs {
-		// Only assert-create can be evaluated without metadata; any other
-		// requirement on a missing table cannot hold.
 		if current == nil && req.GetType() != requirementAssertCreate {
-			return fmt.Errorf("%w: %s: the table does not exist", ErrRequirementFailed, req.GetType())
+			return requirementFailed(req, nil, nil)
 		}
 
 		if err := req.Validate(current); err != nil {
-			return fmt.Errorf("%w: %s: %w", ErrRequirementFailed, req.GetType(), err)
+			return requirementFailed(req, current, err)
 		}
 	}
 
@@ -234,12 +298,47 @@ func createsTable(reqs []table.Requirement) bool {
 	return false
 }
 
-// emptyMetadata is the base that a create commit's updates are applied to.
-func emptyMetadata() (table.Metadata, error) {
-	md, err := table.NewMetadata(iceberg.NewSchema(0), nil, table.UnsortedSortOrder, "", nil)
+// emptyMetadata is the base that a create commit's updates are applied to. It
+// has the format version the updates upgrade to, if any, as in Java's
+// TableMetadata.buildFromEmpty: an upgrade can never go down from the
+// default.
+func emptyMetadata(updates []table.Update) (table.Metadata, error) {
+	props := iceberg.Properties{}
+	if v := requestedFormatVersion(updates); v > 0 {
+		props[table.PropertyFormatVersion] = strconv.Itoa(v)
+	}
+
+	md, err := table.NewMetadata(iceberg.NewSchema(0), nil, table.UnsortedSortOrder, "", props)
 	if err != nil {
-		return nil, fmt.Errorf("building empty metadata: %w", err)
+		return nil, fmt.Errorf("%w: building empty metadata: %w", ErrInvalidRequest, err)
 	}
 
 	return md, nil
+}
+
+// requestedFormatVersion returns the format version of the first
+// upgrade-format-version update, or 0.
+func requestedFormatVersion(updates []table.Update) int {
+	for _, u := range updates {
+		if u.Action() != table.UpdateUpgradeFormatVersion {
+			continue
+		}
+
+		raw, err := json.Marshal(u)
+		if err != nil {
+			return 0
+		}
+
+		var f struct {
+			FormatVersion int `json:"format-version"`
+		}
+
+		if json.Unmarshal(raw, &f) != nil {
+			return 0
+		}
+
+		return f.FormatVersion
+	}
+
+	return 0
 }

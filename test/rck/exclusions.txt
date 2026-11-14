@@ -1,0 +1,27 @@
+# Tests of the REST Compatibility Kit that the server deliberately fails.
+#
+# One Gradle test pattern per line; after "#", the decision it contradicts.
+# A failure that no recorded decision explains is a server bug: fix it, do
+# not add it here. ADR-005 lists these exclusions.
+
+# The test sets a local file:/tmp table location. The server honours requested
+# locations, so the client's S3FileIO must then write manifests to file:/tmp,
+# which it cannot: client and server share only S3 (decision 2 of
+# arch/plan.md, object storage is S3 only).
+*.testCompleteCreateTransaction
+*.testCompleteCreateTransactionV2
+*.testCompleteCreateTransactionMultipleSchemas
+*.testCompleteCreateOrReplaceTransactionCreate
+*.testCompleteCreateOrReplaceTransactionReplace
+*.testCompleteReplaceTransaction
+
+# The test deletes the table's metadata file through the local file system,
+# which only works when client and server share it (decision 2).
+*.testLoadTableWithMissingMetadataFile
+
+# Outside the spec: field IDs of nested fields. The server assigns fresh IDs
+# with iceberg-go, which numbers a struct's fields depth-first; Java numbers
+# all fields of a struct before their children. Both are valid, since the spec
+# fixes no order, and clients read the IDs back from the returned metadata.
+# The test compares against Java's numbering.
+*.testCreateTableWithVariantColumn

@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	"echpochmak/internal/store"
 )
@@ -24,6 +25,9 @@ type Store struct {
 	namespaces map[string]store.NamespaceRecord
 	tables     map[string]store.Pointer
 	views      map[string]store.Pointer
+	purges     map[string]store.PurgeTask
+	// now returns the time recorded as a purge task's creation time.
+	now func() time.Time
 }
 
 var _ store.Store = (*Store)(nil)
@@ -34,6 +38,8 @@ func New() *Store {
 		namespaces: map[string]store.NamespaceRecord{},
 		tables:     map[string]store.Pointer{},
 		views:      map[string]store.Pointer{},
+		purges:     map[string]store.PurgeTask{},
+		now:        time.Now,
 	}
 }
 
@@ -56,7 +62,7 @@ func (s *Store) CreateNamespace(ctx context.Context, ns store.Namespace, props m
 	defer s.mu.Unlock()
 
 	if _, ok := s.namespaces[ns.Encode()]; ok {
-		return fmt.Errorf("%w: %q", store.ErrNamespaceAlreadyExists, ns.String())
+		return fmt.Errorf("%w: %s", store.ErrNamespaceAlreadyExists, ns.String())
 	}
 
 	if err := s.requireNamespace(ns.Parent()); err != nil {
@@ -87,7 +93,7 @@ func (s *Store) GetNamespace(ctx context.Context, ns store.Namespace) (store.Nam
 
 	rec, ok := s.namespaces[ns.Encode()]
 	if !ok {
-		return store.NamespaceRecord{}, fmt.Errorf("%w: %q", store.ErrNamespaceNotFound, ns.String())
+		return store.NamespaceRecord{}, fmt.Errorf("%w: %s", store.ErrNamespaceNotFound, ns.String())
 	}
 
 	return cloneNamespaceRecord(rec), nil
@@ -153,7 +159,7 @@ func (s *Store) UpdateNamespaceProperties(
 
 	rec, ok := s.namespaces[ns.Encode()]
 	if !ok {
-		return store.PropertiesUpdateResult{}, fmt.Errorf("%w: %q", store.ErrNamespaceNotFound, ns.String())
+		return store.PropertiesUpdateResult{}, fmt.Errorf("%w: %s", store.ErrNamespaceNotFound, ns.String())
 	}
 
 	props := cloneProps(rec.Properties)
@@ -201,11 +207,11 @@ func (s *Store) DropNamespace(ctx context.Context, ns store.Namespace) error {
 	defer s.mu.Unlock()
 
 	if _, ok := s.namespaces[ns.Encode()]; !ok {
-		return fmt.Errorf("%w: %q", store.ErrNamespaceNotFound, ns.String())
+		return fmt.Errorf("%w: %s", store.ErrNamespaceNotFound, ns.String())
 	}
 
 	if s.hasChildren(ns) {
-		return fmt.Errorf("%w: %q", store.ErrNamespaceNotEmpty, ns.String())
+		return fmt.Errorf("%w: %s", store.ErrNamespaceNotEmpty, ns.String())
 	}
 
 	delete(s.namespaces, ns.Encode())
@@ -217,6 +223,32 @@ func (s *Store) DropNamespace(ctx context.Context, ns store.Namespace) error {
 // GetTable implements [store.Store].
 func (s *Store) GetTable(ctx context.Context, id store.Ident) (store.Pointer, error) {
 	return s.get(ctx, s.tables, id, store.ErrTableNotFound)
+}
+
+// GetTables implements [store.Store].
+func (s *Store) GetTables(ctx context.Context, ids []store.Ident) ([]store.Pointer, error) {
+	if err := ctxErr(ctx); err != nil {
+		return nil, err
+	}
+
+	if err := validateIdents(ids); err != nil {
+		return nil, err
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	ptrs := make([]store.Pointer, 0, len(ids))
+	for _, id := range ids {
+		p, ok := s.tables[identKey(id)]
+		if !ok {
+			p = store.Pointer{Ident: cloneIdent(id)}
+		}
+
+		ptrs = append(ptrs, clonePointer(p))
+	}
+
+	return ptrs, nil
 }
 
 // ListTables implements [store.Store].
@@ -270,8 +302,29 @@ func (s *Store) RenameTable(ctx context.Context, from, to store.Ident) error {
 }
 
 // DropTable implements [store.Store].
-func (s *Store) DropTable(ctx context.Context, id store.Ident) error {
-	return s.drop(ctx, s.tables, id, store.ErrTableNotFound)
+func (s *Store) DropTable(ctx context.Context, id store.Ident, opts store.DropOptions) (store.Pointer, error) {
+	var task store.PurgeTask
+
+	if opts.Purge {
+		taskID, err := store.NewPurgeTaskID()
+		if err != nil {
+			return store.Pointer{}, err
+		}
+
+		task.ID = taskID
+	}
+
+	return s.drop(ctx, s.tables, id, store.ErrTableNotFound, func(p store.Pointer) {
+		if !opts.Purge {
+			return
+		}
+
+		task.Ident = cloneIdent(p.Ident)
+		task.MetadataLocation = p.MetadataLocation
+		task.Created = s.now()
+		task.Version = s.nextVersion()
+		s.purges[task.ID] = task
+	})
 }
 
 // GetView implements [store.Store].
@@ -322,7 +375,88 @@ func (s *Store) RenameView(ctx context.Context, from, to store.Ident) error {
 
 // DropView implements [store.Store].
 func (s *Store) DropView(ctx context.Context, id store.Ident) error {
-	return s.drop(ctx, s.views, id, store.ErrViewNotFound)
+	_, err := s.drop(ctx, s.views, id, store.ErrViewNotFound, nil)
+
+	return err
+}
+
+// ListPurgeTasks implements [store.Store].
+func (s *Store) ListPurgeTasks(ctx context.Context, limit int) ([]store.PurgeTask, error) {
+	if err := ctxErr(ctx); err != nil {
+		return nil, err
+	}
+
+	if limit <= 0 {
+		return nil, fmt.Errorf("%w: non-positive limit %d", store.ErrInvalidArgument, limit)
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	ids := slices.Sorted(maps.Keys(s.purges))
+	ids = ids[:min(limit, len(ids))]
+	tasks := make([]store.PurgeTask, 0, len(ids))
+
+	for _, id := range ids {
+		tasks = append(tasks, clonePurgeTask(s.purges[id]))
+	}
+
+	return tasks, nil
+}
+
+// ClaimPurgeTask implements [store.Store].
+func (s *Store) ClaimPurgeTask(
+	ctx context.Context,
+	task store.PurgeTask,
+	claim store.PurgeClaim,
+) (store.PurgeTask, error) {
+	if err := ctxErr(ctx); err != nil {
+		return store.PurgeTask{}, err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	current, err := s.purgeTaskAt(task)
+	if err != nil {
+		return store.PurgeTask{}, err
+	}
+
+	current.Claim = claim
+	current.Version = s.nextVersion()
+	s.purges[current.ID] = current
+
+	return clonePurgeTask(current), nil
+}
+
+// CompletePurgeTask implements [store.Store].
+func (s *Store) CompletePurgeTask(ctx context.Context, task store.PurgeTask) error {
+	if err := ctxErr(ctx); err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, err := s.purgeTaskAt(task); err != nil {
+		return err
+	}
+
+	delete(s.purges, task.ID)
+	s.nextVersion()
+
+	return nil
+}
+
+// purgeTaskAt returns the stored task, if it is still at task's version. It
+// must be called with s.mu held.
+func (s *Store) purgeTaskAt(task store.PurgeTask) (store.PurgeTask, error) {
+	current, ok := s.purges[task.ID]
+	if !ok || current.Version != task.Version {
+		return store.PurgeTask{}, fmt.Errorf("%w: %q", store.ErrPurgeTaskChanged, task.ID)
+	}
+
+	return current, nil
 }
 
 func (s *Store) get(
@@ -344,7 +478,7 @@ func (s *Store) get(
 
 	p, ok := entries[identKey(id)]
 	if !ok {
-		return store.Pointer{}, fmt.Errorf("%w: %q", errNotFound, id.String())
+		return store.Pointer{}, fmt.Errorf("%w: %s", errNotFound, id.String())
 	}
 
 	return clonePointer(p), nil
@@ -408,7 +542,7 @@ func (s *Store) rename(
 
 	p, ok := entries[identKey(from)]
 	if !ok {
-		return fmt.Errorf("%w: %q", errNotFound, from.String())
+		return fmt.Errorf("%w: %s", errNotFound, from.String())
 	}
 
 	if err := s.requireNamespace(to.Namespace); err != nil {
@@ -428,31 +562,39 @@ func (s *Store) rename(
 	return nil
 }
 
+// drop removes a pointer and returns it. onDrop, if set, runs under the lock
+// after the removal, so its writes are atomic with it.
 func (s *Store) drop(
 	ctx context.Context,
 	entries map[string]store.Pointer,
 	id store.Ident,
 	errNotFound error,
-) error {
+	onDrop func(store.Pointer),
+) (store.Pointer, error) {
 	if err := ctxErr(ctx); err != nil {
-		return err
+		return store.Pointer{}, err
 	}
 
 	if err := id.Validate(); err != nil {
-		return err
+		return store.Pointer{}, err
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if _, ok := entries[identKey(id)]; !ok {
-		return fmt.Errorf("%w: %q", errNotFound, id.String())
+	p, ok := entries[identKey(id)]
+	if !ok {
+		return store.Pointer{}, fmt.Errorf("%w: %s", errNotFound, id.String())
 	}
 
 	delete(entries, identKey(id))
 	s.nextVersion()
 
-	return nil
+	if onDrop != nil {
+		onDrop(p)
+	}
+
+	return clonePointer(p), nil
 }
 
 // checkCommit reports whether c can be applied to entries. It must be called
@@ -468,7 +610,7 @@ func (s *Store) checkCommit(c store.Commit, entries map[string]store.Pointer, er
 
 		return s.requireNameFree(c.Ident)
 	case !exists:
-		return fmt.Errorf("%w: %q", errNotFound, c.Ident.String())
+		return fmt.Errorf("%w: %s", errNotFound, c.Ident.String())
 	case current.Version != c.ExpectedVersion:
 		return &store.CommitConflictError{
 			Ident:    cloneIdent(c.Ident),
@@ -488,7 +630,7 @@ func (s *Store) requireNamespace(ns store.Namespace) error {
 	}
 
 	if _, ok := s.namespaces[ns.Encode()]; !ok {
-		return fmt.Errorf("%w: %q", store.ErrNamespaceNotFound, ns.String())
+		return fmt.Errorf("%w: %s", store.ErrNamespaceNotFound, ns.String())
 	}
 
 	return nil
@@ -500,11 +642,11 @@ func (s *Store) requireNameFree(id store.Ident) error {
 	key := identKey(id)
 
 	if _, ok := s.tables[key]; ok {
-		return fmt.Errorf("%w: %q", store.ErrTableAlreadyExists, id.String())
+		return fmt.Errorf("%w: %s", store.ErrTableAlreadyExists, id.String())
 	}
 
 	if _, ok := s.views[key]; ok {
-		return fmt.Errorf("%w: %q", store.ErrViewAlreadyExists, id.String())
+		return fmt.Errorf("%w: %s", store.ErrViewAlreadyExists, id.String())
 	}
 
 	return nil
@@ -560,6 +702,27 @@ func validateCommits(commits []store.Commit) error {
 	return nil
 }
 
+// validateIdents checks the identifiers of a batch read: valid, and none
+// twice.
+func validateIdents(ids []store.Ident) error {
+	seen := make(map[string]struct{}, len(ids))
+
+	for _, id := range ids {
+		if err := id.Validate(); err != nil {
+			return err
+		}
+
+		key := identKey(id)
+		if _, dup := seen[key]; dup {
+			return fmt.Errorf("%w: %q requested twice", store.ErrInvalidArgument, id.String())
+		}
+
+		seen[key] = struct{}{}
+	}
+
+	return nil
+}
+
 // identKey is the map key of an identifier. Validated names never contain the
 // separator, so keys are unambiguous.
 func identKey(id store.Ident) string {
@@ -593,6 +756,12 @@ func clonePointer(p store.Pointer) store.Pointer {
 	p.Ident = cloneIdent(p.Ident)
 
 	return p
+}
+
+func clonePurgeTask(t store.PurgeTask) store.PurgeTask {
+	t.Ident = cloneIdent(t.Ident)
+
+	return t
 }
 
 func cloneNamespaceRecord(rec store.NamespaceRecord) store.NamespaceRecord {

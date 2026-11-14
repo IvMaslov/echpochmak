@@ -110,17 +110,18 @@ Phases 1 and 2 are independent and can run in parallel.
 7. **Deduplication:** a request ID on each write, so a write retried after a leader change is applied only once.
 - **Milestone:** the 3-node cluster survives leader kills and network partitions, and `porcupine` reports the operation history as linearizable.
 
-### Phase 3: raftstore adapter and high availability (done, 2026-11-11; see `arch/phase3/adr-004-raftstore.md`)
+### Phase 3: raftstore adapter and high availability (done, 2026-11-11)
 - `raftstore`: a gRPC client with leader discovery, retries with backoff, and the `Store` → KV `Txn` mapping.
 - It must pass the same contract tests as `memstore`.
 - Run 2 or more stateless `catalog-server` replicas behind a load balancer.
 - Add health/readiness probes, graceful shutdown, timeouts, and `Idempotency-Key` support where the spec version has it.
 - **Milestone:** Trino + PyIceberg end-to-end tests pass against MinIO + 3 kv-nodes + 2 servers. Killing a server replica or the raft leader mid-test causes no errors beyond retries.
 
-### Phase 4: Full spec coverage
-- Views, `transactions/commit` (multi-table atomic), `register` table, purge on drop. (Staged create and metrics reporting were done in Phase 1.)
-- Run Iceberg's REST compatibility tests (Java `RESTCatalog` test kit / `iceberg-rest-fixture`) against the server.
-- Swagger UI for rest api. For easy manual testing. 
+### Phase 4: Full spec coverage (done, 2026-11-14)
+- Views, `transactions/commit` (multi-table atomic), `register` table, purge on drop. (Staged create and metrics reporting were done in Phase 1.) Register-view and unregister, both in the pinned spec, were added too.
+- Run Iceberg's REST compatibility tests (Java `RESTCatalog` test kit / `iceberg-rest-fixture`) against the server. Done with the REST Compatibility Kit of Iceberg 1.12.0, as an optional check (`make rck`, `make rck-ha`).
+- Swagger UI for rest api. For easy manual testing.
+- Not served, by decision: OAuth tokens, credential vending, S3 request signing, server-side scan planning, functions.
 
 ### Phase 5: Disaster resistance and operations
 - Periodic raft snapshots exported to S3, plus a tool that rebuilds a cluster from a snapshot.

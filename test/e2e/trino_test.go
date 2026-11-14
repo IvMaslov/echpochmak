@@ -11,7 +11,9 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"slices"
@@ -253,15 +255,7 @@ func TestTrino(t *testing.T) {
 			t.Fatalf("metadata location %q is not in the MinIO warehouse", location)
 		}
 
-		files := fileio.NewIceberg(t.Context(), map[string]string{
-			"s3.endpoint":                 env("E2E_S3_ENDPOINT", "http://localhost:9000"),
-			"s3.region":                   "us-east-1",
-			"s3.access-key-id":            env("E2E_S3_ACCESS_KEY", "minioadmin"),
-			"s3.secret-access-key":        env("E2E_S3_SECRET_KEY", "minioadmin"),
-			"s3.force-virtual-addressing": "false",
-		})
-
-		if _, err := files.Read(t.Context(), location); err != nil {
+		if _, err := s.files().Read(t.Context(), location); err != nil {
 			t.Fatalf("current metadata file is not in MinIO: %v", err)
 		}
 
@@ -271,8 +265,92 @@ func TestTrino(t *testing.T) {
 		}
 	})
 
+	t.Run("views", func(t *testing.T) {
+		view := s.schema + ".recent"
+
+		s.exec("CREATE VIEW %s AS SELECT id, name FROM %s WHERE id > 2", view, tbl)
+		s.expectRows([]string{"3|cc", "4|d", "5|e"}, "SELECT * FROM %s ORDER BY id", view)
+
+		s.exec("CREATE OR REPLACE VIEW %s AS SELECT id FROM %s WHERE id > 4", view, tbl)
+		s.expectRows([]string{"5"}, "SELECT * FROM %s", view)
+
+		// The view is in the catalog, with Trino's SQL.
+		status, body := s.catalogDo(http.MethodGet, "/v1/main/namespaces/"+s.schema+"/views/recent", "")
+		if status != http.StatusOK || !strings.Contains(body, `"dialect":"trino"`) {
+			t.Fatalf("GET view = %d: %s", status, body)
+		}
+
+		// A view cannot take a table's name.
+		if _, err := s.db.ExecContext(t.Context(), fmt.Sprintf("CREATE VIEW %s AS SELECT 1 AS x", tbl)); err == nil {
+			t.Fatal("created a view with the name of a table")
+		}
+
+		s.exec("ALTER VIEW %s RENAME TO %s.recent2", view, s.schema)
+		s.expectRows([]string{"5"}, "SELECT * FROM %s.recent2", s.schema)
+		s.exec("DROP VIEW %s.recent2", s.schema)
+
+		status, _ = s.catalogDo(http.MethodGet, "/v1/main/namespaces/"+s.schema+"/views/recent2", "")
+		if status != http.StatusNotFound {
+			t.Fatalf("GET dropped view = %d, want 404", status)
+		}
+	})
+
+	t.Run("multi-table transaction", func(t *testing.T) {
+		body := fmt.Sprintf(`{"table-changes": [
+			{"identifier": {"namespace": [%[1]q], "name": "t"}, "requirements": [],
+				"updates": [{"action": "set-properties", "updates": {"tx": "1"}}]},
+			{"identifier": {"namespace": [%[1]q], "name": "nation2"}, "requirements": [],
+				"updates": [{"action": "set-properties", "updates": {"tx": "1"}}]}]}`, s.schema)
+
+		status, resp := s.catalogDo(http.MethodPost, "/v1/main/transactions/commit", body)
+		if status != http.StatusNoContent {
+			t.Fatalf("transaction = %d: %s", status, resp)
+		}
+
+		for _, name := range []string{"t", "nation2"} {
+			s.expectRows([]string{"1"}, `SELECT value FROM %s."%s$properties" WHERE key = 'tx'`, s.schema, name)
+		}
+	})
+
+	t.Run("unregister and register", func(t *testing.T) {
+		status, body := s.catalogDo(http.MethodPost, "/v1/main/namespaces/"+s.schema+"/tables/nation2/unregister", "")
+		if status != http.StatusOK {
+			t.Fatalf("unregister = %d: %s", status, body)
+		}
+
+		var unregistered struct {
+			MetadataLocation string `json:"metadata-location"`
+		}
+		if err := json.Unmarshal([]byte(body), &unregistered); err != nil {
+			t.Fatal(err)
+		}
+
+		if slices.Contains(s.rows("SHOW TABLES FROM %s", s.schema), "nation2") {
+			t.Fatal("an unregistered table is still listed")
+		}
+
+		register := fmt.Sprintf(`{"name": "nation3", "metadata-location": %q}`, unregistered.MetadataLocation)
+		status, body = s.catalogDo(http.MethodPost, "/v1/main/namespaces/"+s.schema+"/register", register)
+		if status != http.StatusOK {
+			t.Fatalf("register = %d: %s", status, body)
+		}
+
+		s.expectRows([]string{"25"}, "SELECT count(*) FROM %s.nation3", s.schema)
+	})
+
+	t.Run("drop purges files", func(*testing.T) {
+		files := s.rows(`SELECT file_path FROM %s."t$files"`, s.schema)
+		location, _ := s.loadTable("t")
+		files = append(files, location)
+
+		// Trino's DROP TABLE asks the catalog to purge.
+		s.exec("DROP TABLE %s", tbl)
+
+		s.waitGone(files, time.Minute)
+	})
+
 	t.Run("drop", func(t *testing.T) {
-		for _, name := range []string{"t", "nation2", "c"} {
+		for _, name := range []string{"nation3", "c"} {
 			s.exec("DROP TABLE %s.%s", s.schema, name)
 		}
 
@@ -282,4 +360,69 @@ func TestTrino(t *testing.T) {
 			t.Fatalf("schema %s still listed after drop", s.schema)
 		}
 	})
+}
+
+// catalogDo sends a request to the catalog API and returns the status and
+// the body.
+func (s *suite) catalogDo(method, path, body string) (int, string) {
+	s.t.Helper()
+
+	req, err := http.NewRequestWithContext(s.t.Context(), method, s.catalog+path, strings.NewReader(body))
+	if err != nil {
+		s.t.Fatal(err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		s.t.Fatalf("%s %s: %v", method, path, err)
+	}
+	defer resp.Body.Close()
+
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		s.t.Fatal(err)
+	}
+
+	return resp.StatusCode, string(data)
+}
+
+func (s *suite) files() fileio.FileIO {
+	return fileio.NewIceberg(s.t.Context(), map[string]string{
+		"s3.endpoint":                 env("E2E_S3_ENDPOINT", "http://localhost:9000"),
+		"s3.region":                   "us-east-1",
+		"s3.access-key-id":            env("E2E_S3_ACCESS_KEY", "minioadmin"),
+		"s3.secret-access-key":        env("E2E_S3_SECRET_KEY", "minioadmin"),
+		"s3.force-virtual-addressing": "false",
+	})
+}
+
+// waitGone waits until none of the files exists in MinIO.
+func (s *suite) waitGone(locations []string, timeout time.Duration) {
+	s.t.Helper()
+
+	files := s.files()
+	deadline := time.Now().Add(timeout)
+
+	for {
+		left := []string{}
+
+		for _, location := range locations {
+			if _, err := files.Read(s.t.Context(), location); !errors.Is(err, fileio.ErrNotFound) {
+				left = append(left, location)
+			}
+		}
+
+		if len(left) == 0 {
+			return
+		}
+
+		if time.Now().After(deadline) {
+			s.t.Fatalf("%d of %d files still exist after %s, for example %q",
+				len(left), len(locations), timeout, left[0])
+		}
+
+		time.Sleep(time.Second)
+	}
 }

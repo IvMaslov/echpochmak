@@ -15,6 +15,12 @@ import (
 	"echpochmak/internal/store"
 )
 
+// Table property that allows deleting the table's files; purging honours it.
+const (
+	gcEnabledKey     = "gc.enabled"
+	gcEnabledDefault = true
+)
+
 // Table is a table as served to clients.
 type Table struct {
 	Ident store.Ident
@@ -65,7 +71,7 @@ func (s *Service) CreateTable(ctx context.Context, in CreateTableInput) (Table, 
 	// Reject a taken name before writing anything; the commit below catches
 	// the race where the name is taken in between.
 	if err := s.requireNameFree(ctx, in.Ident); err != nil {
-		return Table{}, err
+		return Table{}, tableNameClash(err, in.Ident)
 	}
 
 	md, err := s.newTableMetadata(in, ns.Properties)
@@ -128,7 +134,7 @@ func (s *Service) persistNewTable(ctx context.Context, id store.Ident, md table.
 
 	ptrs, err := s.store.CommitTables(ctx, []store.Commit{{Ident: id, MetadataLocation: location}})
 	if err != nil {
-		return Table{}, s.handleFailedPointerWrite(ctx, location, err)
+		return Table{}, tableNameClash(s.handleFailedPointerWrite(ctx, err, location), id)
 	}
 
 	s.logFor(ctx).InfoContext(ctx, "table created",
@@ -176,7 +182,7 @@ func (s *Service) ListTables(
 // where they are.
 func (s *Service) RenameTable(ctx context.Context, from, to store.Ident) error {
 	if err := s.store.RenameTable(ctx, from, to); err != nil {
-		return err
+		return renameClash(err, from, to)
 	}
 
 	s.logFor(ctx).InfoContext(ctx, "table renamed",
@@ -187,18 +193,47 @@ func (s *Service) RenameTable(ctx context.Context, from, to store.Ident) error {
 	return nil
 }
 
-// DropTable removes a table from the catalog. Its files are kept even when
-// purge is requested: purging is not implemented yet.
+// DropTable removes a table from the catalog. With purge, its files are
+// deleted afterwards by a purge worker: the drop enqueues the task in the same
+// store write. A table that sets gc.enabled=false cannot be purged; the drop
+// is then rejected and nothing changes.
 func (s *Service) DropTable(ctx context.Context, id store.Ident, purge bool) error {
-	if err := s.store.DropTable(ctx, id); err != nil {
+	if purge {
+		if err := s.checkPurgeAllowed(ctx, id); err != nil {
+			return err
+		}
+	}
+
+	dropped, err := s.store.DropTable(ctx, id, store.DropOptions{Purge: purge})
+	if err != nil {
 		return err
 	}
 
 	s.logFor(ctx).InfoContext(ctx, "table dropped",
 		slog.String(logger.KeyTable, id.String()),
-		slog.Bool("purge_requested", purge),
-		slog.Bool("files_kept", true),
+		slog.String(logger.KeyLocation, dropped.MetadataLocation),
+		slog.Bool("purge", purge),
 	)
+
+	return nil
+}
+
+// checkPurgeAllowed fails if the table's current metadata disables garbage
+// collection.
+func (s *Service) checkPurgeAllowed(ctx context.Context, id store.Ident) error {
+	ptr, err := s.store.GetTable(ctx, id)
+	if err != nil {
+		return err
+	}
+
+	md, _, err := s.readMetadata(ctx, ptr.MetadataLocation)
+	if err != nil {
+		return err
+	}
+
+	if !md.Properties().GetBool(gcEnabledKey, gcEnabledDefault) {
+		return fmt.Errorf("%w: cannot purge %q: the table sets %s=false", ErrInvalidRequest, id.String(), gcEnabledKey)
+	}
 
 	return nil
 }
@@ -224,7 +259,7 @@ func (s *Service) requireNameFree(ctx context.Context, id store.Ident) error {
 
 	switch {
 	case err == nil:
-		return fmt.Errorf("%w: %q", store.ErrTableAlreadyExists, id.String())
+		return fmt.Errorf("%w: %s", store.ErrTableAlreadyExists, id.String())
 	case !errors.Is(err, store.ErrTableNotFound):
 		return err
 	}
@@ -233,7 +268,7 @@ func (s *Service) requireNameFree(ctx context.Context, id store.Ident) error {
 
 	switch {
 	case err == nil:
-		return fmt.Errorf("%w: %q", store.ErrViewAlreadyExists, id.String())
+		return fmt.Errorf("%w: %s", store.ErrViewAlreadyExists, id.String())
 	case !errors.Is(err, store.ErrViewNotFound):
 		return err
 	default:

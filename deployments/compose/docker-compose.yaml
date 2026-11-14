@@ -71,6 +71,8 @@ services:
       ECHPOCHMAK_S3_PATH_STYLE: "true"
       ECHPOCHMAK_S3_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
       ECHPOCHMAK_S3_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      # Scan the purge queue often, so a dropped table's files go quickly.
+      ECHPOCHMAK_PURGE_INTERVAL: 2s
     ports:
       - "8181:8181"
 
@@ -86,6 +88,31 @@ services:
       - "8080:8080"
     volumes:
       - ./trino/catalog/iceberg.properties:/etc/trino/catalog/iceberg.properties:ro
+
+  # Iceberg's REST Compatibility Kit, under the "rck" profile: an optional
+  # check, run with `make rck` (one in-memory catalog) or `make rck-ha`.
+  rck:
+    profiles: ["rck"]
+    build:
+      context: ../..
+      dockerfile: build/rck/Dockerfile
+      network: ${BUILD_NETWORK:-default}
+    image: echpochmak/rck:1.12.0
+    depends_on:
+      - catalog
+    environment:
+      CATALOG_URI: http://catalog:8181
+      CATALOG_WAREHOUSE: s3://${MINIO_BUCKET}/
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      CATALOG_S3_ENDPOINT: http://minio:9000
+      CATALOG_S3_PATH__STYLE__ACCESS: "true"
+      # Credentials as engines get them: never from the catalog.
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      AWS_REGION: ${S3_REGION}
+      RCK_EXCLUSIONS: /rck/exclusions.txt
+    volumes:
+      - ../../test/rck/exclusions.txt:/rck/exclusions.txt:ro
 
   # A 3-node KV cluster, under the "kv" profile: start it with
   # `docker compose --profile kv up`. The catalog does not use it until

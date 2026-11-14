@@ -105,25 +105,25 @@ func (b createTableBody) input(ns store.Namespace) (catalog.CreateTableInput, er
 	}
 
 	if isAbsent(b.Schema) {
-		return in, fmt.Errorf("%w: a schema is required", catalog.ErrInvalidRequest)
+		return in, fmt.Errorf("%w: a schema is required", errBadRequest)
 	}
 
 	in.Schema = &iceberg.Schema{}
 	if err := json.Unmarshal(b.Schema, in.Schema); err != nil {
-		return in, fmt.Errorf("%w: schema: %w", catalog.ErrInvalidRequest, err)
+		return in, fmt.Errorf("%w: schema: %w", errBadRequest, err)
 	}
 
 	if !isAbsent(b.PartitionSpec) {
 		in.PartitionSpec = &iceberg.PartitionSpec{}
 		if err := json.Unmarshal(b.PartitionSpec, in.PartitionSpec); err != nil {
-			return in, fmt.Errorf("%w: partition spec: %w", catalog.ErrInvalidRequest, err)
+			return in, fmt.Errorf("%w: partition spec: %w", errBadRequest, err)
 		}
 	}
 
 	if !isAbsent(b.WriteOrder) {
 		in.SortOrder = &table.SortOrder{}
 		if err := json.Unmarshal(b.WriteOrder, in.SortOrder); err != nil {
-			return in, fmt.Errorf("%w: write order: %w", catalog.ErrInvalidRequest, err)
+			return in, fmt.Errorf("%w: write order: %w", errBadRequest, err)
 		}
 	}
 
@@ -192,7 +192,7 @@ func (s *Server) UpdateTable(
 		named := store.Ident{Namespace: store.Namespace(body.Identifier.Namespace), Name: body.Identifier.Name}
 		if !named.Equal(id) {
 			return nil, fmt.Errorf("%w: body identifier %q does not match the path %q",
-				catalog.ErrInvalidRequest, named.String(), id.String())
+				errBadRequest, named.String(), id.String())
 		}
 	}
 
@@ -234,7 +234,7 @@ func (s *Server) RenameTable(
 	}
 
 	if req.Body == nil {
-		return nil, fmt.Errorf("%w: missing request body", catalog.ErrInvalidRequest)
+		return nil, fmt.Errorf("%w: missing request body", errBadRequest)
 	}
 
 	from := store.Ident{Namespace: store.Namespace(req.Body.Source.Namespace), Name: req.Body.Source.Name}

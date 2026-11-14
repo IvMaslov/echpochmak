@@ -77,15 +77,12 @@ func TestUnimplementedOperations(t *testing.T) {
 	tests := []struct {
 		method, target, body string
 	}{
-		{method: http.MethodGet, target: "/v1/main/namespaces/db/views"},
-		{method: http.MethodGet, target: "/v1/main/namespaces/db/views/v"},
-		{method: http.MethodPost, target: "/v1/main/transactions/commit", body: `{"table-changes":[]}`},
-		{
-			method: http.MethodPost,
-			target: "/v1/main/namespaces/db/register",
-			body:   `{"name":"t","metadata-location":"x"}`,
-		},
+		// Out of scope: no authentication, no credential vending, no
+		// server-side scan planning, no functions.
 		{method: http.MethodPost, target: "/v1/oauth/tokens", body: ``},
+		{method: http.MethodGet, target: "/v1/main/namespaces/db/tables/t/credentials"},
+		{method: http.MethodPost, target: "/v1/main/namespaces/db/tables/t/plan", body: `{}`},
+		{method: http.MethodGet, target: "/v1/main/namespaces/db/functions"},
 	}
 
 	for _, tt := range tests {

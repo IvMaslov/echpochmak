@@ -4,7 +4,10 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"time"
 	"unicode"
+
+	"github.com/google/uuid"
 )
 
 // NamespaceSeparator separates namespace levels in their encoded form. It is
@@ -215,4 +218,52 @@ func validateName(name string) error {
 	}
 
 	return nil
+}
+
+// DropOptions configures [Store.DropTable].
+type DropOptions struct {
+	// Purge enqueues a [PurgeTask] for the dropped table's files.
+	Purge bool
+}
+
+// PurgeTask is a queued deletion of a dropped table's files.
+type PurgeTask struct {
+	// ID identifies the task; the store assigns it.
+	ID string
+	// Ident is the dropped table, for logs.
+	Ident Ident
+	// MetadataLocation is the table's last metadata file, where the purge
+	// starts collecting files.
+	MetadataLocation string
+	// Created is when the table was dropped.
+	Created time.Time
+	// Claim is the current claim; zero when the task is unclaimed.
+	Claim PurgeClaim
+	// Version changes with every claim; claims and completion compare it.
+	Version Version
+}
+
+// PurgeClaim is a worker's lease on a [PurgeTask].
+type PurgeClaim struct {
+	// Owner names the worker, for logs.
+	Owner string
+	// Until is when the lease expires and another worker may take over.
+	Until time.Time
+}
+
+// Claimable reports whether the task may be claimed at now: it is unclaimed,
+// or its claim has expired.
+func (t PurgeTask) Claimable(now time.Time) bool {
+	return t.Claim.Until.IsZero() || !now.Before(t.Claim.Until)
+}
+
+// NewPurgeTaskID returns a new task ID. IDs are UUIDv7 strings, so sorting
+// them sorts tasks by creation time.
+func NewPurgeTaskID() (string, error) {
+	id, err := uuid.NewV7()
+	if err != nil {
+		return "", fmt.Errorf("generating a purge task ID: %w", err)
+	}
+
+	return id.String(), nil
 }
