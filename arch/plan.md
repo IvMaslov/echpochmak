@@ -20,7 +20,7 @@ The three-part split in `prompt.md` matches how production REST catalogs are bui
 ## Architecture
 
 ```
- Spark / Trino / PyIceberg
+ Trino / PyIceberg
           │  Iceberg REST (OpenAPI)
           ▼
  ┌──────────────────────────┐   N stateless replicas behind a load balancer
@@ -77,8 +77,8 @@ internal/fileio/         S3/MinIO writer/reader (aws-sdk-go-v2 or minio-go)
 internal/store/          Store interface, error types, key encoding, contract tests
 internal/store/memstore  internal/store/raftstore
 internal/kv/             raft node, WAL, snapshots, state machine, transport, gRPC KV service
-deploy/                  docker-compose (MinIO, 3 kv-nodes, 2 servers, Spark), k8s manifests
-test/e2e/                PyIceberg/Spark scenarios
+deploy/                  docker-compose (MinIO, 3 kv-nodes, 2 servers, Trino), k8s manifests
+test/e2e/                Trino/PyIceberg scenarios
 ```
 
 **Reuse:** `github.com/apache/iceberg-go` has the table-metadata types and update/requirement logic (a metadata builder). Using it saves weeks of re-implementing the spec's update semantics, so check its coverage first.
@@ -110,16 +110,17 @@ Phases 1 and 2 are independent and can run in parallel.
 7. **Deduplication:** a request ID on each write, so a write retried after a leader change is applied only once.
 - **Milestone:** the 3-node cluster survives leader kills and network partitions, and `porcupine` reports the operation history as linearizable.
 
-### Phase 3: raftstore adapter and high availability
+### Phase 3: raftstore adapter and high availability (done, 2026-11-11; see `arch/phase3/adr-004-raftstore.md`)
 - `raftstore`: a gRPC client with leader discovery, retries with backoff, and the `Store` → KV `Txn` mapping.
 - It must pass the same contract tests as `memstore`.
 - Run 2 or more stateless `catalog-server` replicas behind a load balancer.
 - Add health/readiness probes, graceful shutdown, timeouts, and `Idempotency-Key` support where the spec version has it.
-- **Milestone:** Spark + PyIceberg end-to-end tests pass against MinIO + 3 kv-nodes + 2 servers. Killing a server replica or the raft leader mid-test causes no errors beyond retries.
+- **Milestone:** Trino + PyIceberg end-to-end tests pass against MinIO + 3 kv-nodes + 2 servers. Killing a server replica or the raft leader mid-test causes no errors beyond retries.
 
 ### Phase 4: Full spec coverage
 - Views, `transactions/commit` (multi-table atomic), `register` table, purge on drop. (Staged create and metrics reporting were done in Phase 1.)
 - Run Iceberg's REST compatibility tests (Java `RESTCatalog` test kit / `iceberg-rest-fixture`) against the server.
+- Swagger UI for rest api. For easy manual testing. 
 
 ### Phase 5: Disaster resistance and operations
 - Periodic raft snapshots exported to S3, plus a tool that rebuilds a cluster from a snapshot.
@@ -136,4 +137,4 @@ Phases 1 and 2 are independent and can run in parallel.
   - An in-process multi-node cluster with a fault-injecting transport that drops, delays and partitions messages.
   - `porcupine` linearizability checks.
   - Crash-recovery tests: kill a node mid-write, then restart it from the WAL and snapshot.
-- **End-to-end:** PyIceberg and Spark in docker-compose with MinIO.
+- **End-to-end:** Trino and PyIceberg in docker-compose with MinIO. Trino is the only SQL engine; Spark is too heavy for the test stack.

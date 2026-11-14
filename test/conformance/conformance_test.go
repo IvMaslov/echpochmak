@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -25,16 +26,46 @@ import (
 	"echpochmak/internal/api"
 	"echpochmak/internal/catalog"
 	"echpochmak/internal/fileio"
+	"echpochmak/internal/kv/kvtest"
+	"echpochmak/internal/store"
 	"echpochmak/internal/store/memstore"
+	"echpochmak/internal/store/raftstore"
 )
 
-// newServer starts a catalog server with an empty store and returns its URL.
-func newServer(t *testing.T) string {
+// storeFactory returns an empty store for one catalog server.
+type storeFactory func(t *testing.T) store.Store
+
+// forEachBackend runs fn once per store backend: memory, and raft on a
+// 3-node in-process KV cluster over real gRPC. On raft, every store gets its
+// own key prefix, so servers within one test stay independent.
+func forEachBackend(t *testing.T, fn func(t *testing.T, newStore storeFactory)) {
+	t.Helper()
+
+	t.Run("memory", func(t *testing.T) {
+		t.Parallel()
+		fn(t, func(*testing.T) store.Store { return memstore.New() })
+	})
+
+	t.Run("raft", func(t *testing.T) {
+		t.Parallel()
+
+		cl := kvtest.NewGRPCCluster(t, 3).Client()
+
+		var n atomic.Int64
+
+		fn(t, func(*testing.T) store.Store {
+			return raftstore.New(cl, raftstore.Options{Prefix: fmt.Sprintf("conformance/%d/", n.Add(1))})
+		})
+	})
+}
+
+// newServer starts a catalog server on st and returns its URL.
+func newServer(t *testing.T, st store.Store) string {
 	t.Helper()
 
 	log := slog.New(slog.DiscardHandler)
 	svc := catalog.New(catalog.Options{
-		Store:         memstore.New(),
+		Store:         st,
 		Files:         fileio.NewIceberg(context.Background(), nil),
 		Warehouse:     "mem://conformance/" + strings.ReplaceAll(t.Name(), "/", "_"),
 		CommitRetries: catalog.DefaultCommitRetries,
@@ -65,13 +96,17 @@ func newClient(t *testing.T, uri string) *rest.Catalog {
 func TestCatalogConformance(t *testing.T) {
 	t.Parallel()
 
-	catalogtest.RunCatalogTests(t, catalogtest.Config{
-		NewCatalog: func(t *testing.T) icebergcatalog.Catalog {
-			t.Helper()
+	forEachBackend(t, func(t *testing.T, newStore storeFactory) {
+		t.Helper()
 
-			return newClient(t, newServer(t))
-		},
-		SupportsNamespaceProperties: true,
+		catalogtest.RunCatalogTests(t, catalogtest.Config{
+			NewCatalog: func(t *testing.T) icebergcatalog.Catalog {
+				t.Helper()
+
+				return newClient(t, newServer(t, newStore(t)))
+			},
+			SupportsNamespaceProperties: true,
+		})
 	})
 }
 
@@ -142,9 +177,14 @@ func countRows(t *testing.T, tbl *table.Table) map[string]int64 {
 // an engine running INSERT and SELECT.
 func TestAppendAndScan(t *testing.T) {
 	t.Parallel()
+	forEachBackend(t, testAppendAndScan)
+}
+
+func testAppendAndScan(t *testing.T, newStore storeFactory) {
+	t.Helper()
 
 	ctx := t.Context()
-	cat := newClient(t, newServer(t))
+	cat := newClient(t, newServer(t, newStore(t)))
 	ident := table.Identifier{"db", "events"}
 
 	if err := cat.CreateNamespace(ctx, table.Identifier{"db"}, nil); err != nil {
@@ -186,11 +226,16 @@ func TestAppendAndScan(t *testing.T) {
 // server's retries or the client's, never by losing data.
 func TestConcurrentAppends(t *testing.T) {
 	t.Parallel()
+	forEachBackend(t, testConcurrentAppends)
+}
+
+func testConcurrentAppends(t *testing.T, newStore storeFactory) {
+	t.Helper()
 
 	const writers = 4
 
 	ctx := t.Context()
-	uri := newServer(t)
+	uri := newServer(t, newStore(t))
 	ident := table.Identifier{"db", "shared"}
 
 	setup := newClient(t, uri)

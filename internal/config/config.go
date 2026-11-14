@@ -28,6 +28,7 @@ const EnvPrefix = "ECHPOCHMAK_"
 // Store backends.
 const (
 	StoreMemory = "memory"
+	StoreRaft   = "raft"
 )
 
 // warehouseSchemes returns the URL schemes accepted by -s3-warehouse. file://
@@ -56,6 +57,9 @@ type Catalog struct {
 	// MetadataCacheSize is the number of metadata files kept in memory; zero
 	// disables the cache.
 	MetadataCacheSize int
+	// IdempotencyLifetime is how long an Idempotency-Key is honoured; zero
+	// disables idempotency support.
+	IdempotencyLifetime time.Duration
 }
 
 // HTTP configures the HTTP server.
@@ -70,11 +74,20 @@ type HTTP struct {
 	ShutdownTimeout time.Duration
 	// MaxBodyBytes limits the size of request bodies.
 	MaxBodyBytes int64
+	// DrainDelay is how long a stopping server keeps serving while it reports
+	// itself unready, so a load balancer moves new requests elsewhere first.
+	DrainDelay time.Duration
 }
 
 // Store selects and configures the store backend.
 type Store struct {
 	Backend string
+	// KVEndpoints are the client endpoints of the KV cluster (raft backend).
+	KVEndpoints []string
+	// KVAttemptTimeout bounds one attempt of the KV client on one node.
+	KVAttemptTimeout time.Duration
+	// KVRequestTimeout bounds one store call, the client's retries included.
+	KVRequestTimeout time.Duration
 }
 
 // S3 configures access to the object storage that holds metadata files.
@@ -169,6 +182,8 @@ func register(fs *flag.FlagSet, cfg *Config) {
 	fs.DurationVar(&cfg.HTTP.IdleTimeout, "http-idle-timeout", 120*time.Second, "keep-alive idle timeout")
 	fs.DurationVar(&cfg.HTTP.ShutdownTimeout, "http-shutdown-timeout", 20*time.Second, "graceful shutdown timeout")
 	fs.Int64Var(&cfg.HTTP.MaxBodyBytes, "http-max-body-bytes", 16<<20, "maximum request body size in bytes")
+	fs.DurationVar(&cfg.HTTP.DrainDelay, "http-drain-delay", 0,
+		"on shutdown, report unready for this long before draining; set it to the load balancer's check interval")
 
 	fs.TextVar(&cfg.Log.Level, "log-level", slog.LevelInfo, "log level: debug, info, warn, error")
 	fs.TextVar(&cfg.Log.Format, "log-format", logger.FormatJSON, "log format: json, text")
@@ -183,7 +198,19 @@ func register(fs *flag.FlagSet, cfg *Config) {
 		"metadata files cached in memory; 0 disables",
 	)
 
-	fs.StringVar(&cfg.Store.Backend, "store-backend", StoreMemory, "store backend: memory")
+	fs.DurationVar(&cfg.Catalog.IdempotencyLifetime, "idempotency-lifetime", 30*time.Minute,
+		"how long an Idempotency-Key is honoured; 0 disables idempotency support")
+
+	fs.StringVar(&cfg.Store.Backend, "store-backend", StoreMemory, "store backend: memory or raft")
+	fs.Func("kv-endpoints", "KV cluster client endpoints, comma-separated (raft backend)", func(v string) error {
+		cfg.Store.KVEndpoints = splitList(v)
+
+		return nil
+	})
+	fs.DurationVar(&cfg.Store.KVAttemptTimeout, "kv-attempt-timeout", 2*time.Second,
+		"timeout of one KV client attempt on one node")
+	fs.DurationVar(&cfg.Store.KVRequestTimeout, "kv-request-timeout", 5*time.Second,
+		"timeout of one store call, KV client retries included")
 
 	fs.StringVar(&cfg.S3.Endpoint, "s3-endpoint", "", "S3 endpoint URL; empty for AWS")
 	fs.StringVar(&cfg.S3.Region, "s3-region", "us-east-1", "S3 region")
@@ -279,9 +306,7 @@ func (cfg Config) Validate() error {
 
 	errs = append(errs, cfg.Catalog.validate()...)
 
-	if cfg.Store.Backend != StoreMemory {
-		errs = append(errs, fmt.Errorf("store-backend %q is not supported, want %q", cfg.Store.Backend, StoreMemory))
-	}
+	errs = append(errs, cfg.validateStore()...)
 
 	schemes := warehouseSchemes()
 	if !slices.ContainsFunc(schemes, func(scheme string) bool {
@@ -305,6 +330,44 @@ func (cfg Config) Validate() error {
 	return nil
 }
 
+// commitStoreCalls is how many store calls one commit attempt makes: read the
+// pointer, then swap it.
+const commitStoreCalls = 2
+
+func (cfg Config) validateStore() []error {
+	var errs []error
+
+	switch cfg.Store.Backend {
+	case StoreMemory:
+		return nil
+	case StoreRaft:
+	default:
+		return []error{fmt.Errorf("store-backend %q is not supported, want %q or %q",
+			cfg.Store.Backend, StoreMemory, StoreRaft)}
+	}
+
+	if len(cfg.Store.KVEndpoints) == 0 {
+		errs = append(errs, errors.New("kv-endpoints is required for the raft backend"))
+	}
+
+	if cfg.Store.KVAttemptTimeout <= 0 || cfg.Store.KVRequestTimeout < cfg.Store.KVAttemptTimeout {
+		errs = append(errs, fmt.Errorf("need 0 < kv-attempt-timeout (%s) <= kv-request-timeout (%s)",
+			cfg.Store.KVAttemptTimeout, cfg.Store.KVRequestTimeout))
+	}
+
+	// The budgets must nest, or a commit the server is still retrying is
+	// reported to the client as a failure when the HTTP response times out.
+	worstCommit := time.Duration((cfg.Catalog.CommitRetries+1)*commitStoreCalls) * cfg.Store.KVRequestTimeout
+	if cfg.HTTP.WriteTimeout <= worstCommit {
+		errs = append(errs, fmt.Errorf(
+			"http-write-timeout (%s) must exceed the worst-case commit, "+
+				"(commit-retries+1) x %d x kv-request-timeout = %s",
+			cfg.HTTP.WriteTimeout, commitStoreCalls, worstCommit))
+	}
+
+	return errs
+}
+
 func (c Catalog) validate() []error {
 	var errs []error
 
@@ -314,6 +377,10 @@ func (c Catalog) validate() []error {
 
 	if c.CommitRetries < 0 {
 		errs = append(errs, fmt.Errorf("commit-retries must not be negative, got %d", c.CommitRetries))
+	}
+
+	if c.IdempotencyLifetime < 0 {
+		errs = append(errs, fmt.Errorf("idempotency-lifetime must not be negative, got %s", c.IdempotencyLifetime))
 	}
 
 	if c.MetadataCacheSize < 0 {
@@ -334,11 +401,13 @@ func (cfg Config) LogValue() slog.Value {
 			slog.Duration("idle_timeout", cfg.HTTP.IdleTimeout),
 			slog.Duration("shutdown_timeout", cfg.HTTP.ShutdownTimeout),
 			slog.Int64("max_body_bytes", cfg.HTTP.MaxBodyBytes),
+			slog.Duration("drain_delay", cfg.HTTP.DrainDelay),
 		),
 		slog.Group("catalog",
 			slog.String("name", cfg.Catalog.Name),
 			slog.Int("commit_retries", cfg.Catalog.CommitRetries),
 			slog.Int("metadata_cache_size", cfg.Catalog.MetadataCacheSize),
+			slog.Duration("idempotency_lifetime", cfg.Catalog.IdempotencyLifetime),
 		),
 		slog.Group("log",
 			slog.String("min_level", cfg.Log.Level.String()),
@@ -347,6 +416,9 @@ func (cfg Config) LogValue() slog.Value {
 		),
 		slog.Group("store",
 			slog.String("backend", cfg.Store.Backend),
+			slog.Any("kv_endpoints", cfg.Store.KVEndpoints),
+			slog.Duration("kv_attempt_timeout", cfg.Store.KVAttemptTimeout),
+			slog.Duration("kv_request_timeout", cfg.Store.KVRequestTimeout),
 		),
 		slog.Group("s3",
 			slog.String("endpoint", cfg.S3.Endpoint),

@@ -125,6 +125,26 @@ kv-chaos: deployments/compose/.env ## Check a 3-node KV cluster in docker for li
 		docker volume rm -f echpochmak_kv1-data echpochmak_kv2-data echpochmak_kv3-data >/dev/null; \
 		exit $$status
 
+HA_COMPOSE := docker compose -f deployments/compose/docker-compose.yaml \
+	-f deployments/compose/docker-compose.ha.yaml --env-file deployments/compose/.env --profile kv
+
+.PHONY: ha-up
+ha-up: deployments/compose/.env ## Start the HA stack: 3 kv-nodes, 2 catalogs behind HAProxy, MinIO, Trino, PyIceberg
+	$(HA_COMPOSE) up -d --build --wait
+
+.PHONY: ha-down
+ha-down: deployments/compose/.env ## Remove the HA stack, its containers and volumes
+	$(HA_COMPOSE) down -v --remove-orphans
+
+.PHONY: ha-e2e
+ha-e2e: deployments/compose/.env ## Run the HA milestone suite and the Trino suite on the HA stack, then remove it
+	$(HA_COMPOSE) up -d --build --wait
+	status=0; \
+		go test -tags ha -count=1 -v -timeout 30m ./test/ha/ || status=$$?; \
+		[ $$status -ne 0 ] || go test -tags e2e -count=1 -v ./test/e2e/ || status=$$?; \
+		$(HA_COMPOSE) down -v --remove-orphans; \
+		exit $$status
+
 .PHONY: cover
 cover: ## Run tests with coverage and write an HTML report
 	go test -race -count=1 -covermode=atomic -coverprofile=$(COVER_PROFILE) ./...

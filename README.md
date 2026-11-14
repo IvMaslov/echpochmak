@@ -17,15 +17,17 @@ Design docs and phase plans are in [`arch/`](arch/).
 
 ## Status
 
-Phase 1 is done: namespaces and tables work end to end with Trino, against
-MinIO, using the in-memory store. Views, multi-table transactions, register
-and purge return `501` and are not advertised to clients. **Catalog state is
-lost on restart** until the raft store arrives (Phase 3); table data and
-metadata files stay in object storage.
+Phases 1–3 are done:
+- Namespaces and tables work end to end with Trino and PyIceberg, against
+  MinIO.
+- With `-store-backend raft`, the catalog keeps its state in the replicated
+  KV cluster (`kv-node`). Any number of stateless catalog replicas can run
+  behind a load balancer; they survive losing a replica or the raft leader.
+- `Idempotency-Key` retries are honoured across replicas.
 
-Phase 2 is done: the raft KV cluster (`kv-node`, `kvctl`) runs on its own
-and passes linearizability checks under leader kills, partitions and
-restarts. Phase 3 connects the catalog to it.
+Views, multi-table transactions, register and purge return `501` and are not
+advertised to clients (Phase 4). With the default in-memory backend, catalog
+state is lost on restart.
 
 ## Requirements
 
@@ -44,6 +46,8 @@ make e2e           # compose stack + Trino end-to-end tests
 make generate      # regenerate the API code and the KV protocol
 make kv-chaos      # 3-node KV cluster in docker, linearizability under chaos
 make kv-torture    # longer in-process linearizability run, random seed
+make ha-up         # HA stack: 3 kv-nodes, 2 catalogs behind HAProxy, Trino, PyIceberg
+make ha-e2e        # HA milestone suite under failures, then remove the stack
 ```
 
 ## Try it
@@ -127,6 +131,28 @@ restarts from it and ignores `-initial-cluster` and `-join`. In compose, the
 same cluster runs under the `kv` profile
 (`docker compose --profile kv up`), on host ports 23791–23793.
 
+## High availability
+
+`make ha-up` starts the HA stack:
+- 3 kv-nodes.
+- Two catalog replicas on the raft backend: `catalog-a` on host port
+  18181, `catalog-b` on 18182.
+- HAProxy on port 8181, which health-checks `/readyz`.
+- MinIO, Trino and a PyIceberg container.
+
+Clients use `localhost:8181` exactly as with the single catalog. Inspect the
+catalog's state in the KV store with `kvctl`:
+
+```sh
+export ECHPOCHMAK_KV_ENDPOINTS=localhost:23791,localhost:23792,localhost:23793
+bin/kvctl get cat/v1/ -prefix
+```
+
+`make ha-e2e` writes through Trino and PyIceberg while it kills catalog
+replicas and the raft leader, and checks that no acknowledged row is lost or
+duplicated. `make ha-down` removes the stack, its containers and its
+volumes.
+
 ## Configuration
 
 `catalog-server -help` and `kv-node -help` list every flag. Each flag can also be set with an
@@ -143,6 +169,11 @@ Notable settings:
 | `-commit-retries` | `4` | Server-side retries of a commit after a concurrent change |
 | `-metadata-cache-size` | `1000` | Metadata files cached in memory (`0` disables) |
 | `-http-max-body-bytes` | `16 MiB` | Request body limit |
+| `-store-backend` | `memory` | `memory`, or `raft` for the replicated KV store |
+| `-kv-endpoints` | — | KV client endpoints, comma-separated (raft backend) |
+| `-kv-attempt-timeout` / `-kv-request-timeout` | `2s` / `5s` | One KV attempt / one store call with retries; must nest under `-http-write-timeout` (checked at startup) |
+| `-idempotency-lifetime` | `30m` | How long an `Idempotency-Key` is honoured; `0` disables it |
+| `-http-drain-delay` | `0` | On shutdown, report unready this long before draining; set it to the load balancer's health-check window |
 
 ## Layout
 
@@ -154,6 +185,8 @@ internal/catalog/     catalog operations: create, load and commit tables
 internal/fileio/      object storage access and the metadata cache
 internal/store/       Store interface, types, errors; storetest/ contract suite
 internal/store/memstore/
+internal/store/raftstore/  Store on the KV cluster
+internal/idempotency/ Idempotency-Key protocol, memory and KV stores
 api/kv/               KV cluster protocol (protobuf, buf config)
 internal/kv/          KV cluster: kvpb (generated), statemachine, raftlog,
                       node, transport, server, client, daemon, kvtest
@@ -164,6 +197,7 @@ internal/tools/       code-generation helpers
 test/conformance/     in-process tests through iceberg-go's REST client
 test/e2e/             Trino end-to-end tests (build tag e2e)
 test/kvchaos/         KV linearizability under docker chaos (build tag kvchaos)
+test/ha/              HA milestone suite (build tag ha), PyIceberg writer
 build/                Dockerfiles
 deployments/compose/  local environment
 arch/                 design docs, plans, ADRs

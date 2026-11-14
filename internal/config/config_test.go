@@ -72,7 +72,18 @@ func TestLoadErrors(t *testing.T) {
 		{name: "help", args: []string{"-help"}, want: flag.ErrHelp.Error()},
 		{name: "bad env value", vars: map[string]string{"ECHPOCHMAK_LOG_FORMAT": "xml"}, want: "ECHPOCHMAK_LOG_FORMAT"},
 		{name: "non-positive timeout", args: []string{"-http-idle-timeout", "0s"}, want: "http-idle-timeout"},
-		{name: "unsupported backend", args: []string{"-store-backend", "raft"}, want: "store-backend"},
+		{name: "unsupported backend", args: []string{"-store-backend", "etcd"}, want: "store-backend"},
+		{name: "raft without endpoints", args: []string{"-store-backend", "raft"}, want: "kv-endpoints"},
+		{
+			name: "budgets do not nest",
+			args: []string{"-store-backend", "raft", "-kv-endpoints", "a:2379", "-http-write-timeout", "10s"},
+			want: "worst-case commit",
+		},
+		{
+			name: "attempt longer than request",
+			args: []string{"-store-backend", "raft", "-kv-endpoints", "a:2379", "-kv-attempt-timeout", "9s"},
+			want: "kv-attempt-timeout",
+		},
 		{name: "bad warehouse", args: []string{"-s3-warehouse", "/tmp/w"}, want: "s3-warehouse"},
 		{name: "bad catalog name", args: []string{"-catalog-name", "a/b"}, want: "catalog-name"},
 		{name: "negative retries", args: []string{"-commit-retries", "-1"}, want: "commit-retries"},
@@ -126,6 +137,22 @@ func TestSecretIsRedacted(t *testing.T) {
 		if strings.Contains(out, "hunter2") {
 			t.Fatalf("secret leaked: %s", out)
 		}
+	}
+}
+
+func TestRaftBackend(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := config.Load(nil, env(map[string]string{
+		"ECHPOCHMAK_STORE_BACKEND": "raft",
+		"ECHPOCHMAK_KV_ENDPOINTS":  "kv1:2379, kv2:2379,kv3:2379",
+	}))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	if len(cfg.Store.KVEndpoints) != 3 || cfg.Store.KVEndpoints[1] != "kv2:2379" {
+		t.Fatalf("KVEndpoints = %q", cfg.Store.KVEndpoints)
 	}
 }
 

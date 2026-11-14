@@ -15,6 +15,9 @@ package api
 import (
 	"context"
 	"fmt"
+	"time"
+
+	openapi_types "github.com/oapi-codegen/runtime/types"
 
 	"echpochmak/internal/api/gen"
 	"echpochmak/internal/catalog"
@@ -25,14 +28,31 @@ import (
 type Server struct {
 	catalog *catalog.Service
 	prefix  string
+	// idempotencyLifetime is advertised in /v1/config; zero advertises no
+	// support.
+	idempotencyLifetime time.Duration
+}
+
+// ServerOption configures a Server.
+type ServerOption func(*Server)
+
+// WithIdempotencyLifetime advertises Idempotency-Key support, honoured for
+// lifetime, in /v1/config.
+func WithIdempotencyLifetime(lifetime time.Duration) ServerOption {
+	return func(s *Server) { s.idempotencyLifetime = lifetime }
 }
 
 var _ gen.StrictServerInterface = (*Server)(nil)
 
 // NewServer returns a Server for the catalog named prefix: clients put the
 // prefix, returned by /v1/config, in every request path.
-func NewServer(svc *catalog.Service, prefix string) *Server {
-	return &Server{catalog: svc, prefix: prefix}
+func NewServer(svc *catalog.Service, prefix string, opts ...ServerOption) *Server {
+	s := &Server{catalog: svc, prefix: prefix}
+	for _, opt := range opts {
+		opt(s)
+	}
+
+	return s
 }
 
 // checkPrefix rejects requests for another catalog.
@@ -72,11 +92,26 @@ func (s *Server) ident(prefix gen.Prefix, ns gen.NamespaceParam, name gen.Table)
 func (s *Server) GetConfig(context.Context, gen.GetConfigRequestObject) (gen.GetConfigResponseObject, error) {
 	endpoints := Endpoints()
 
-	return gen.GetConfig200JSONResponse{
+	resp := gen.GetConfig200JSONResponse{
 		Defaults:  map[string]string{},
 		Overrides: map[string]string{"prefix": s.prefix},
 		Endpoints: &endpoints,
-	}, nil
+	}
+
+	if s.idempotencyLifetime > 0 {
+		resp.IdempotencyKeyLifetime = isoDuration(s.idempotencyLifetime)
+	}
+
+	return resp, nil
+}
+
+// isoDuration converts d to the ISO-8601 duration of the spec, such as PT30M.
+func isoDuration(d time.Duration) *openapi_types.Duration {
+	return &openapi_types.Duration{
+		Hours:   int(d / time.Hour),
+		Minutes: int(d % time.Hour / time.Minute),
+		Seconds: (d % time.Minute).Seconds(),
+	}
 }
 
 // Endpoints returns the operations this server implements, in the format of

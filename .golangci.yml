@@ -13,6 +13,7 @@ run:
   build-tags:
     - e2e
     - kvchaos
+    - ha
   modules-download-mode: readonly
 
 issues:
@@ -255,7 +256,7 @@ linters:
           - goconst
           - thelper
       # The end-to-end scenario is a sequence of steps on shared state.
-      - path: test/(e2e|kvchaos)/
+      - path: test/(e2e|kvchaos|ha)/
         linters:
           - paralleltest
           - tparallel

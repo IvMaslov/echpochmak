@@ -1,0 +1,82 @@
+# High-availability stack, layered on docker-compose.yaml:
+#
+#   make ha-up      start it      make ha-down    remove it
+#
+# Two catalog replicas on the raft store (the kv1-kv3 nodes of the "kv"
+# profile) behind HAProxy. HAProxy answers to the name "catalog" on port
+# 8181, so Trino and the single-catalog tests reach it unchanged. The
+# single in-memory catalog of the base file is disabled.
+
+services:
+  catalog:
+    # Disabled: only started with the "single" profile, which the HA stack
+    # never enables.
+    profiles: ["single"]
+
+  catalog-a: &catalog-replica
+    profiles: ["kv"]
+    image: echpochmak/catalog-server:dev
+    build:
+      context: ../..
+      dockerfile: build/catalog-server/Dockerfile
+      network: ${BUILD_NETWORK:-default}
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+      kv1:
+        condition: service_started
+      kv2:
+        condition: service_started
+      kv3:
+        condition: service_started
+    environment: &catalog-env
+      ECHPOCHMAK_HTTP_ADDR: ":8181"
+      ECHPOCHMAK_HTTP_DRAIN_DELAY: 3s
+      ECHPOCHMAK_LOG_FORMAT: text
+      ECHPOCHMAK_STORE_BACKEND: raft
+      ECHPOCHMAK_KV_ENDPOINTS: kv1:2379,kv2:2379,kv3:2379
+      ECHPOCHMAK_S3_ENDPOINT: http://minio:9000
+      ECHPOCHMAK_S3_REGION: ${S3_REGION}
+      ECHPOCHMAK_S3_WAREHOUSE: s3://${MINIO_BUCKET}/
+      ECHPOCHMAK_S3_PATH_STYLE: "true"
+      ECHPOCHMAK_S3_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      ECHPOCHMAK_S3_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+    # Direct access to each replica, for tests that must pick one.
+    ports:
+      - "18181:8181"
+
+  catalog-b:
+    <<: *catalog-replica
+    ports:
+      - "18182:8181"
+
+  lb:
+    profiles: ["kv"]
+    image: haproxy:3.4@sha256:f6d2ee87b47192d9cc8c22e88fef405122ff339859644883edc2a7d1827f87b3
+    depends_on:
+      - catalog-a
+      - catalog-b
+    volumes:
+      - ./haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    ports:
+      - "8181:8181"
+    networks:
+      default:
+        aliases: [catalog]
+
+  trino:
+    depends_on: !override
+      - lb
+
+  pyiceberg:
+    profiles: ["kv"]
+    build:
+      context: ../../build/pyiceberg
+      network: ${BUILD_NETWORK:-default}
+    image: echpochmak/pyiceberg:0.12.0
+    environment:
+      S3_ACCESS_KEY: ${MINIO_ROOT_USER}
+      S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+      S3_REGION: ${S3_REGION}
+    volumes:
+      - ../../test/ha/pyiceberg:/scripts:ro

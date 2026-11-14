@@ -15,7 +15,9 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync/atomic"
 	"syscall"
+	"time"
 
 	// Registers the s3:// scheme with iceberg-go's file IO.
 	_ "github.com/apache/iceberg-go/io/gocloud/s3"
@@ -24,9 +26,12 @@ import (
 	"echpochmak/internal/catalog"
 	"echpochmak/internal/config"
 	"echpochmak/internal/fileio"
+	"echpochmak/internal/idempotency"
+	"echpochmak/internal/kv/client"
 	"echpochmak/internal/logger"
 	"echpochmak/internal/store"
 	"echpochmak/internal/store/memstore"
+	"echpochmak/internal/store/raftstore"
 	"echpochmak/internal/version"
 )
 
@@ -62,44 +67,60 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	st, err := newStore(cfg.Store)
+	b, err := newBackend(cfg.Store, log)
 	if err != nil {
 		return err
 	}
+	defer b.close()
 
 	// Storage clients must keep working while in-flight requests drain after
 	// a shutdown signal cancels ctx.
 	storageCtx := context.WithoutCancel(ctx)
 	files := fileio.NewCached(fileio.NewIceberg(storageCtx, cfg.S3.IOProps()), cfg.Catalog.MetadataCacheSize)
 	svc := catalog.New(catalog.Options{
-		Store:         st,
+		Store:         b.store,
 		Files:         files,
 		Warehouse:     cfg.S3.Warehouse,
 		CommitRetries: cfg.Catalog.CommitRetries,
 		Logger:        log,
 	})
 
+	guard := newGuard(ctx, cfg, b.records, log)
+
+	serverOpts := []api.ServerOption{}
+	if guard != nil {
+		serverOpts = append(serverOpts, api.WithIdempotencyLifetime(guard.Lifetime()))
+	}
+
+	var draining atomic.Bool
+
 	srv := &http.Server{
 		Addr: cfg.HTTP.Addr,
 		Handler: api.NewHandler(api.Options{
 			Logger:       log,
 			Ready:        svc,
-			Server:       api.NewServer(svc, cfg.Catalog.Name),
+			Draining:     draining.Load,
+			Server:       api.NewServer(svc, cfg.Catalog.Name, serverOpts...),
 			MaxBodyBytes: cfg.HTTP.MaxBodyBytes,
+			Idempotency:  guard,
 		}),
 		ReadHeaderTimeout: cfg.HTTP.ReadHeaderTimeout,
 		ReadTimeout:       cfg.HTTP.ReadTimeout,
 		WriteTimeout:      cfg.HTTP.WriteTimeout,
 		IdleTimeout:       cfg.HTTP.IdleTimeout,
 		ErrorLog:          slog.NewLogLogger(log.Handler(), slog.LevelWarn),
-		BaseContext:       func(net.Listener) context.Context { return ctx },
+		// Requests must not be cancelled by the shutdown signal: they are
+		// still served while draining, and Shutdown ends them.
+		BaseContext: func(net.Listener) context.Context { return storageCtx },
 	}
 
-	return serve(ctx, srv, cfg.HTTP, log)
+	return serve(ctx, srv, cfg.HTTP, &draining, log)
 }
 
-// serve runs srv until ctx is cancelled, then shuts it down gracefully.
-func serve(ctx context.Context, srv *http.Server, cfg config.HTTP, log *slog.Logger) error {
+// serve runs srv until ctx is cancelled, then shuts it down gracefully: it
+// first reports itself unready for the drain delay, so a load balancer moves
+// new requests to other replicas, then finishes the requests in flight.
+func serve(ctx context.Context, srv *http.Server, cfg config.HTTP, draining *atomic.Bool, log *slog.Logger) error {
 	errCh := make(chan error, 1)
 
 	go func() {
@@ -113,7 +134,13 @@ func serve(ctx context.Context, srv *http.Server, cfg config.HTTP, log *slog.Log
 	case <-ctx.Done():
 	}
 
-	log.InfoContext(ctx, "shutting down", slog.Duration("timeout", cfg.ShutdownTimeout))
+	log.InfoContext(ctx, "shutting down",
+		slog.Duration("drain_delay", cfg.DrainDelay),
+		slog.Duration("timeout", cfg.ShutdownTimeout),
+	)
+
+	draining.Store(true)
+	time.Sleep(cfg.DrainDelay)
 
 	// The parent context is already cancelled; shutdown needs its own deadline.
 	shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cfg.ShutdownTimeout)
@@ -132,11 +159,63 @@ func serve(ctx context.Context, srv *http.Server, cfg config.HTTP, log *slog.Log
 	return nil
 }
 
-func newStore(cfg config.Store) (store.Store, error) {
+// backend is the configured storage: the catalog store, the idempotency
+// records next to it, and what releases them.
+type backend struct {
+	store   store.Store
+	records idempotency.Store
+	close   func()
+}
+
+func newBackend(cfg config.Store, log *slog.Logger) (backend, error) {
 	switch cfg.Backend {
 	case config.StoreMemory:
-		return memstore.New(), nil
+		return backend{store: memstore.New(), records: idempotency.NewMemoryStore(), close: func() {}}, nil
+	case config.StoreRaft:
+		c, err := client.New(client.Config{
+			Endpoints:      cfg.KVEndpoints,
+			AttemptTimeout: cfg.KVAttemptTimeout,
+			Logger:         log,
+		})
+		if err != nil {
+			return backend{}, fmt.Errorf("connecting to the KV cluster: %w", err)
+		}
+
+		closeClient := func() {
+			if err := c.Close(); err != nil {
+				log.Warn("closing the KV client failed", logger.Err(err))
+			}
+		}
+
+		return backend{
+			store:   raftstore.New(c, raftstore.Options{CallTimeout: cfg.KVRequestTimeout}),
+			records: idempotency.NewKVStore(c, raftstore.DefaultPrefix),
+			close:   closeClient,
+		}, nil
 	default:
-		return nil, fmt.Errorf("unsupported store backend %q", cfg.Backend)
+		return backend{}, fmt.Errorf("unsupported store backend %q", cfg.Backend)
 	}
+}
+
+// janitorInterval is how often expired idempotency records are deleted.
+const janitorInterval = time.Minute
+
+// newGuard returns the idempotency guard, or nil when idempotency is
+// disabled. Its janitor runs until ctx is done. A claim's lease is twice the
+// HTTP write timeout: no request outlives it, so a live claim is never taken
+// over.
+func newGuard(ctx context.Context, cfg config.Config, records idempotency.Store, log *slog.Logger) *idempotency.Guard {
+	if cfg.Catalog.IdempotencyLifetime <= 0 {
+		return nil
+	}
+
+	g := idempotency.NewGuard(records, idempotency.Options{
+		Lifetime: cfg.Catalog.IdempotencyLifetime,
+		Lease:    2 * cfg.HTTP.WriteTimeout,
+		Logger:   log,
+	})
+
+	go g.RunJanitor(ctx, janitorInterval)
+
+	return g
 }

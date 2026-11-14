@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"echpochmak/internal/api"
@@ -163,6 +164,33 @@ func TestReadyzReportsStoreFailure(t *testing.T) {
 
 	if rec := serve(h, http.MethodGet, "/healthz", ""); rec.Code != http.StatusOK {
 		t.Fatalf("GET /healthz = %d, want 200 even when the store is down", rec.Code)
+	}
+}
+
+func TestReadyzWhileDraining(t *testing.T) {
+	t.Parallel()
+
+	var draining atomic.Bool
+
+	h := api.NewHandler(api.Options{
+		Logger:   slog.New(slog.DiscardHandler),
+		Ready:    memstore.New(),
+		Draining: draining.Load,
+		Server:   api.NewServer(nil, "main"),
+	})
+
+	if rec := serve(h, http.MethodGet, "/readyz", ""); rec.Code != http.StatusOK {
+		t.Fatalf("GET /readyz = %d before draining, want 200", rec.Code)
+	}
+
+	draining.Store(true)
+
+	if rec := serve(h, http.MethodGet, "/readyz", ""); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("GET /readyz = %d while draining, want 503", rec.Code)
+	}
+
+	if rec := serve(h, http.MethodGet, "/healthz", ""); rec.Code != http.StatusOK {
+		t.Fatalf("GET /healthz = %d while draining, want 200: the process is alive", rec.Code)
 	}
 }
 
