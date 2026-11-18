@@ -1,55 +1,104 @@
 # echpochmak
 
 An [Apache Iceberg REST catalog](https://iceberg.apache.org/spec/#iceberg-rest-catalog)
-server, with catalog state kept in a raft-replicated key-value store.
+server in Go, with its state in a **raft-replicated key-value store built on
+[`go.etcd.io/raft/v3`](https://github.com/etcd-io/raft)** — no etcd, no
+database: the WAL, snapshots, transport, membership and client protocol are
+part of this project.
 
-- **catalog-server** is a stateless HTTP server implementing the Iceberg REST
-  API. Run as many replicas as you like behind a load balancer.
-- **kv-node** is one node of a raft cluster, built on `go.etcd.io/raft/v3`,
-  that stores namespaces, table and view pointers and the purge queue;
-  **kvctl** administers it, **kv-backup** backs it up to object storage.
-- **catalogctl** compares the catalog with object storage after a restore.
-- **Store** is the interface between them (`internal/store`). An in-memory
-  implementation is used for tests and local development.
+Engines such as Trino, Spark and PyIceberg use it as their catalog: they
+create namespaces, tables and views through it and commit changes with
+optimistic concurrency. The catalog writes each table's metadata file to
+S3-compatible storage and swaps the table's pointer with compare-and-swap in
+the KV store.
 
-Table metadata files live in S3-compatible object storage (AWS S3 or MinIO).
+```
+ Trino · PyIceberg · Java RESTCatalog
+                 │  Iceberg REST
+                 ▼
+ HAProxy ──► catalog-server × N      stateless; any replica serves any request
+                 │         └───────► S3 / MinIO   table metadata files
+                 ▼ gRPC
+ kv-node × 3 or 5                    raft consensus, Pebble per node
+                 ▲
+ kv-backup ──────┘ ─────────────────► S3          scheduled snapshots
+```
 
-Design docs and phase plans are in [`arch/`](arch/).
+The full architecture, layer by layer, with diagrams of every flow, is in
+[`arch/phase5/architecture.pdf`](arch/phase5/architecture.pdf).
+
+## Features
+
+- **The Iceberg REST spec for tables and views**: namespaces, tables (also
+  staged creates), views, atomic multi-table transactions
+  (`transactions/commit`), register, register-view, unregister, rename, and
+  `DROP TABLE … purge`, which a worker on every replica carries out from a
+  durable queue.
+- **Tested against real clients**: Trino 484 and PyIceberg 0.12 end to end,
+  iceberg-go's REST client in process, and Iceberg's own Java REST
+  Compatibility Kit (with a short, documented list of exclusions).
+- **High availability**: any number of stateless catalog replicas behind a
+  load balancer; a 3- or 5-node KV cluster that survives losing nodes, the
+  raft leader or a whole zone. `Idempotency-Key` retries work across
+  replicas.
+- **A KV store checked for linearizability** with
+  [porcupine](https://github.com/anishathalye/porcupine), under leader kills,
+  partitions and message loss, in process and in Docker.
+- **Disaster recovery**: scheduled, verified backups to S3; a restore that
+  builds a new cluster from a snapshot; a report that rolls tables forward
+  to the commits made after the backup; an unsafe recovery from one
+  surviving node.
+- **No leaked files**: commit intents and a janitor delete the metadata files
+  of commits that never landed.
+- **Observability**: Prometheus metrics on every binary, OpenTelemetry
+  traces from the HTTP request down to the raft proposal, trace IDs in the
+  logs, and a Grafana dashboard.
+- **A Swagger UI** at `/docs` that shows exactly the served operations.
+
+### Binaries
+
+| Binary | Role |
+|--------|------|
+| `catalog-server` | The Iceberg REST API. Stateless; with `-store-backend raft` its state is in the KV cluster |
+| `kv-node` | One node of the raft KV cluster |
+| `kvctl` | Administers the cluster: keys, membership, leader transfer, snapshots and restore |
+| `kv-backup` | Backs the cluster up to S3 on a schedule, with retention and test restores |
+| `catalogctl` | Compares the catalog with object storage after a restore |
 
 ## Status
 
-Phases 1–5 are done:
-- Namespaces, tables and views work end to end with Trino and PyIceberg,
-  against MinIO.
-- Multi-table transactions (`transactions/commit`), register, register-view
-  and unregister are served.
-- `DROP TABLE ... purge` deletes the table's files: a purge worker on every
-  replica works a durable queue in the store.
-- With `-store-backend raft`, the catalog keeps its state in the replicated
-  KV cluster (`kv-node`). Any number of stateless catalog replicas can run
-  behind a load balancer; they survive losing a replica or the raft leader.
-- `Idempotency-Key` retries are honoured across replicas, for every
-  mutation.
-- Iceberg's own REST Compatibility Kit passes, with a short list of
-  documented exclusions (`test/rck/exclusions.txt`).
-- A Swagger UI at `/docs` shows the served endpoints.
-- The KV cluster is backed up to S3 on a schedule and restored with one
-  documented procedure; a 5-node cluster in 3 zones survives losing a zone.
-- Files of commits that never landed are cleaned up by a janitor.
-- Every component exports Prometheus metrics and OpenTelemetry traces; a
-  compose overlay adds Prometheus, Grafana and Jaeger.
+This is a working, heavily tested implementation, built in phases
+(`arch/plan.md`). It is not hardened for production:
 
-How to run it in production, and what to do when something fails, is in
-[`docs/operations.md`](docs/operations.md).
+- **No authentication and no TLS**: run it on a trusted network only. Anyone
+  who reaches a port can read and write the catalog.
+- **One catalog per deployment**, no multi-tenancy, and **no credential
+  vending**: engines bring their own S3 credentials.
+- Not served, and not advertised to clients: OAuth tokens, credential
+  vending, S3 request signing, server-side scan planning and functions.
+- With the default in-memory backend, catalog state is lost on restart; use
+  `-store-backend raft` for anything that should survive.
 
-Not served, and not advertised to clients: OAuth tokens, credential vending,
-S3 request signing, server-side scan planning and functions. With the default
-in-memory backend, catalog state is lost on restart.
+How to run it, and what to do when something fails, is in
+[`docs/operations.md`](docs/operations.md). Known limitations of each phase
+are listed in its ADR.
 
 ## Requirements
 
-- Go 1.26.2 (see `go.mod`)
-- Docker with Compose v2, for the local environment
+- Go 1.26.2 (see `go.mod`) and GNU Make
+- Docker with Compose v2, for the local environment and the end-to-end
+  suites
+
+```sh
+git clone <this repository> && cd echpochmak
+make build        # binaries in ./bin
+make test         # unit, contract and in-process cluster tests; no Docker needed
+make compose-up   # MinIO, a catalog and Trino; creates deployments/compose/.env from .env.example
+```
+
+The compose files use local development credentials only (MinIO's
+`minioadmin`); change them in `deployments/compose/.env`, which is not
+tracked.
 
 ## Common tasks
 
@@ -307,3 +356,36 @@ deployments/compose/  local environment
 arch/                 design docs, plans, ADRs
 docs/                 operator's guide
 ```
+
+## Documentation
+
+| Document | Contents |
+|----------|----------|
+| [`arch/phase5/architecture.pdf`](arch/phase5/architecture.pdf) | The whole system by layers, with diagrams of every flow |
+| [`docs/operations.md`](docs/operations.md) | Deployment rules, runbooks per failure, backups and restore, metrics and traces |
+| [`arch/plan.md`](arch/plan.md) | Decisions, architecture and the phased plan |
+| `arch/phase0` … `arch/phase5` | Each phase's detailed plan and its ADR (ADR-001 … ADR-006) |
+
+## Contributing
+
+Issues and pull requests are welcome. Before sending a change:
+
+```sh
+make ci    # tidy, generated-code check, protocol compatibility, lint, tests, build
+```
+
+Changes to the KV protocol go in `api/kv/proto` and need `make generate`;
+`make buf-breaking` rejects incompatible changes. Changes that touch
+replication or failure handling should also pass `make ha-e2e`, and those
+that touch backups or restore `make dr-e2e`; both need Docker. The code
+follows `.claude/skills/go-code-style.md`, and golangci-lint must report
+no issues.
+
+## License
+
+[MIT](LICENSE). Third-party code keeps its own licence: the vendored
+Swagger UI in `internal/api/swaggerui/dist` is under the Apache License 2.0
+(its `LICENSE` and `NOTICE` are next to it), and
+`.claude/skills/go-code-style.md` is MIT-licensed by its author, as its
+header states.
+
