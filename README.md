@@ -219,7 +219,8 @@ same cluster runs under the `kv` profile
 - 3 kv-nodes.
 - Two catalog replicas on the raft backend: `catalog-a` on host port
   18181, `catalog-b` on 18182.
-- HAProxy on port 8181, which health-checks `/readyz`.
+- HAProxy on port 8181, which health-checks `/readyz`; its statistics page
+  is at http://localhost:8404/stats.
 - MinIO, Trino and a PyIceberg container.
 
 Clients use `localhost:8181` exactly as with the single catalog. Inspect the
@@ -363,6 +364,7 @@ docs/                 operator's guide
 |----------|----------|
 | [`arch/phase5/architecture.pdf`](arch/phase5/architecture.pdf) | The whole system by layers, with diagrams of every flow |
 | [`docs/operations.md`](docs/operations.md) | Deployment rules, runbooks per failure, backups and restore, metrics and traces |
+| [`example/`](example/) | One guide per docker compose file: every tool in the stack, with its local URLs |
 | [`arch/plan.md`](arch/plan.md) | Decisions, architecture and the phased plan |
 | `arch/phase0` … `arch/phase5` | Each phase's detailed plan and its ADR (ADR-001 … ADR-006) |
 

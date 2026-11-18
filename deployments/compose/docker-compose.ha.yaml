@@ -64,6 +64,7 @@ services:
       - ./haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
     ports:
       - "8181:8181"
+      - "8404:8404" # statistics page: http://localhost:8404/stats
     networks:
       default:
         aliases: [catalog]
