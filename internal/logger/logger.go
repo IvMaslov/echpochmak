@@ -11,6 +11,8 @@ import (
 	"io"
 	"log/slog"
 	"os"
+
+	"go.opentelemetry.io/otel/trace"
 )
 
 // Attribute keys shared across the application. Use them instead of string
@@ -95,10 +97,44 @@ func New(w io.Writer, cfg Config, service string) *slog.Logger {
 		instance = "unknown"
 	}
 
-	return slog.New(handler).With(
+	return slog.New(traceHandler{handler}).With(
 		slog.String(KeyService, service),
 		slog.String(KeyInstance, instance),
 	)
+}
+
+// Keys of the trace attributes added to records logged in a traced context.
+const (
+	KeyTraceID = "trace_id"
+	KeySpanID  = "span_id"
+)
+
+// traceHandler adds the trace and span IDs of the record's context, if it is
+// traced, so logs and traces can be joined.
+type traceHandler struct {
+	slog.Handler
+}
+
+// Handle implements [slog.Handler].
+func (h traceHandler) Handle(ctx context.Context, r slog.Record) error {
+	if sc := trace.SpanContextFromContext(ctx); sc.IsValid() {
+		r.AddAttrs(
+			slog.String(KeyTraceID, sc.TraceID().String()),
+			slog.String(KeySpanID, sc.SpanID().String()),
+		)
+	}
+
+	return h.Handler.Handle(ctx, r) //nolint:wrapcheck // a decorator passes the handler's error through.
+}
+
+// WithAttrs implements [slog.Handler].
+func (h traceHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return traceHandler{h.Handler.WithAttrs(attrs)}
+}
+
+// WithGroup implements [slog.Handler].
+func (h traceHandler) WithGroup(name string) slog.Handler {
+	return traceHandler{h.Handler.WithGroup(name)}
 }
 
 // Err returns the attribute for an error.

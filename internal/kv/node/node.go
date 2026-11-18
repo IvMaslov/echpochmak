@@ -28,6 +28,8 @@ import (
 	"github.com/cockroachdb/pebble/v2/vfs"
 	"go.etcd.io/raft/v3"
 	"go.etcd.io/raft/v3/raftpb"
+	"go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/noop"
 	"google.golang.org/protobuf/proto"
 
 	"echpochmak/internal/kv/kvpb"
@@ -102,6 +104,10 @@ type Config struct {
 
 	StateMachine statemachine.Options
 	Logger       *slog.Logger
+	// Metrics records events and timings; nil records nothing.
+	Metrics *Metrics
+	// Tracer traces proposals and reads; nil traces nothing.
+	Tracer trace.Tracer
 }
 
 func (c *Config) setDefaults() {
@@ -120,6 +126,10 @@ func (c *Config) setDefaults() {
 	if c.Logger == nil {
 		c.Logger = slog.Default()
 	}
+
+	if c.Tracer == nil {
+		c.Tracer = noop.NewTracerProvider().Tracer("")
+	}
 }
 
 // Node is a running member of the cluster.
@@ -132,6 +142,7 @@ type Node struct {
 	raft      raft.Node
 	transport Transport
 	clusterID string
+	metrics   *Metrics
 
 	leader atomic.Uint64
 	term   atomic.Uint64
@@ -158,6 +169,10 @@ func Start(cfg Config) (*Node, error) {
 
 	if cfg.ID == 0 {
 		return nil, errors.New("node ID must not be zero")
+	}
+
+	if err := checkRestoreMarker(cfg.FS, cfg.DataDir); err != nil {
+		return nil, err
 	}
 
 	if err := createDataDir(cfg.FS, cfg.DataDir); err != nil {
@@ -191,6 +206,7 @@ func newNode(cfg Config, db *pebble.DB) (*Node, error) {
 		db:          db,
 		sm:          sm,
 		transport:   cfg.Transport,
+		metrics:     cfg.Metrics,
 		applied:     newProgress(sm.AppliedIndex()),
 		proposals:   newWaiters[*kvpb.Result](),
 		reads:       newWaiters[uint64](),

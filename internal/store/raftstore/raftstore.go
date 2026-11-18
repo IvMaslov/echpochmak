@@ -26,13 +26,15 @@ import (
 // TxnBudget is the number of compares, and of operations per branch, that the
 // KV store accepts in one transaction. It bounds CommitTables and GetTables:
 // in a commit, an update costs one compare and one read, a create three of
-// each, so one transaction holds up to 128 updates or 42 creates.
+// each, and a commit intent one more. So one transaction holds up to 127
+// updates or 42 creates with an intent, 128 updates without.
 const TxnBudget = 128
 
-// Costs of one commit against [TxnBudget].
+// Costs against [TxnBudget]: of one commit, and of the intent of a call.
 const (
 	updateCost = 1
 	createCost = 3
+	intentCost = 1
 )
 
 // casRetries bounds the read-modify-write loops of property updates and
@@ -93,15 +95,16 @@ func (s *Store) Ping(ctx context.Context) error {
 }
 
 // mapErr translates a KV client error into the store's error model. A write
-// whose outcome is unknown, and a cluster that could not be reached, both
-// become [store.ErrUnavailable]: callers must assume the write may have
-// happened. The original error stays wrapped, so context errors still match.
+// whose outcome is unknown becomes [store.ErrOutcomeUnknown], which also
+// matches [store.ErrUnavailable]; a cluster that could not be reached at all
+// is [store.ErrUnavailable] alone: the write certainly did not happen. The
+// original error stays wrapped, so context errors still match.
 func mapErr(err error) error {
 	switch {
 	case errors.Is(err, client.ErrInvalidArgument):
 		return fmt.Errorf("%w: %w", store.ErrInvalidArgument, err)
 	case errors.Is(err, client.ErrOutcomeUnknown):
-		return fmt.Errorf("%w: write outcome unknown: %w", store.ErrUnavailable, err)
+		return store.OutcomeUnknown(err)
 	case errors.Is(err, client.ErrUnavailable):
 		return fmt.Errorf("%w: %w", store.ErrUnavailable, err)
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):

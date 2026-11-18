@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"testing"
 
 	"echpochmak/internal/kv/client"
@@ -60,18 +61,28 @@ func TestNameOf(t *testing.T) {
 func TestMapErr(t *testing.T) {
 	t.Parallel()
 
+	unknown := []error{store.ErrOutcomeUnknown, store.ErrUnavailable}
+
 	tests := []struct {
-		in   error
-		want []error
+		in      error
+		want    []error
+		notWant []error
 	}{
-		{fmt.Errorf("x: %w", client.ErrOutcomeUnknown), []error{store.ErrUnavailable, client.ErrOutcomeUnknown}},
-		{fmt.Errorf("x: %w", client.ErrUnavailable), []error{store.ErrUnavailable}},
-		{fmt.Errorf("x: %w", client.ErrInvalidArgument), []error{store.ErrInvalidArgument}},
 		{
-			fmt.Errorf("%w: %w", client.ErrOutcomeUnknown, context.Canceled),
-			[]error{store.ErrUnavailable, context.Canceled},
+			in:   fmt.Errorf("x: %w", client.ErrOutcomeUnknown),
+			want: append(slices.Clone(unknown), client.ErrOutcomeUnknown),
 		},
-		{context.DeadlineExceeded, []error{context.DeadlineExceeded}},
+		{
+			in:      fmt.Errorf("x: %w", client.ErrUnavailable),
+			want:    []error{store.ErrUnavailable},
+			notWant: []error{store.ErrOutcomeUnknown},
+		},
+		{in: fmt.Errorf("x: %w", client.ErrInvalidArgument), want: []error{store.ErrInvalidArgument}},
+		{
+			in:   fmt.Errorf("%w: %w", client.ErrOutcomeUnknown, context.Canceled),
+			want: append(slices.Clone(unknown), context.Canceled),
+		},
+		{in: context.DeadlineExceeded, want: []error{context.DeadlineExceeded}},
 	}
 
 	for _, tt := range tests {
@@ -79,6 +90,12 @@ func TestMapErr(t *testing.T) {
 		for _, want := range tt.want {
 			if !errors.Is(got, want) {
 				t.Errorf("mapErr(%v) = %v, does not match %v", tt.in, got, want)
+			}
+		}
+
+		for _, notWant := range tt.notWant {
+			if errors.Is(got, notWant) {
+				t.Errorf("mapErr(%v) = %v, matches %v", tt.in, got, notWant)
 			}
 		}
 	}

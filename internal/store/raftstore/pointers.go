@@ -292,6 +292,11 @@ func (s *Store) commit(ctx context.Context, kind pointerKind, commits []store.Co
 		return nil, err
 	}
 
+	intent, err := store.CommitsIntent(commits)
+	if err != nil {
+		return nil, err
+	}
+
 	req := &kvpb.TxnRequest{}
 
 	for _, c := range commits {
@@ -323,13 +328,21 @@ func (s *Store) commit(ctx context.Context, kind pointerKind, commits []store.Co
 		req.Success = append(req.Success, client.OpPut(key, value))
 	}
 
+	// The intent comes last, so commitFailure finds it after the commits.
+	if !intent.IsZero() {
+		key := s.k.intent(intent.ID)
+		req.Compare = append(req.Compare, atRevision(key, int64(intent.Version)))
+		req.Success = append(req.Success, client.OpDelete(key, nil))
+		req.Failure = append(req.Failure, read(key))
+	}
+
 	resp, err := s.txn(ctx, req)
 	if err != nil {
 		return nil, err
 	}
 
 	if !resp.GetSucceeded() {
-		return nil, commitFailure(kind, commits, resp)
+		return nil, commitFailure(kind, commits, intent, resp)
 	}
 
 	version := store.Version(resp.GetHeader().GetRevision())
@@ -347,8 +360,14 @@ func (s *Store) commit(ctx context.Context, kind pointerKind, commits []store.Co
 }
 
 // commitFailure finds the first commit, in order, whose precondition did not
-// hold, from the keys read by the failure branch.
-func commitFailure(kind pointerKind, commits []store.Commit, resp *kvpb.TxnResponse) error {
+// hold, from the keys read by the failure branch; if every commit's held, the
+// intent had changed.
+func commitFailure(
+	kind pointerKind,
+	commits []store.Commit,
+	intent store.IntentRef,
+	resp *kvpb.TxnResponse,
+) error {
 	next := 0
 
 	for _, c := range commits {
@@ -382,6 +401,13 @@ func commitFailure(kind pointerKind, commits []store.Commit, resp *kvpb.TxnRespo
 				Expected: c.ExpectedVersion,
 				Actual:   store.Version(own.GetModRevision()),
 			}
+		}
+	}
+
+	if !intent.IsZero() {
+		kv := readResult(resp, next)
+		if kv == nil || store.Version(kv.GetModRevision()) != intent.Version {
+			return fmt.Errorf("%w: %q", store.ErrIntentChanged, intent.ID)
 		}
 	}
 
@@ -511,14 +537,19 @@ func validateCommits(commits []store.Commit) error {
 		seen[key] = true
 	}
 
+	if !commits[0].Intent.IsZero() {
+		cost += intentCost
+	}
+
 	if cost > TxnBudget {
 		return fmt.Errorf(
-			"%w: the transaction is too large: it costs %d of %d (an update costs %d, a create %d)",
+			"%w: the transaction is too large: it costs %d of %d (an update costs %d, a create %d, an intent %d)",
 			store.ErrInvalidArgument,
 			cost,
 			TxnBudget,
 			updateCost,
 			createCost,
+			intentCost,
 		)
 	}
 

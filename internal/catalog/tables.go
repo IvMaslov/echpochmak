@@ -127,14 +127,27 @@ func (s *Service) persistNewTable(ctx context.Context, id store.Ident, md table.
 		return Table{}, err
 	}
 
-	raw, err := s.writeMetadata(ctx, location, md)
-	if err != nil {
-		return Table{}, err
-	}
+	var (
+		raw  []byte
+		ptrs []store.Pointer
+	)
 
-	ptrs, err := s.store.CommitTables(ctx, []store.Commit{{Ident: id, MetadataLocation: location}})
+	err = s.writeAndCommit(ctx, id, location,
+		func() (err error) {
+			raw, err = s.writeMetadata(ctx, location, md)
+
+			return err
+		},
+		func(intent store.IntentRef) (err error) {
+			ptrs, err = s.store.CommitTables(ctx, []store.Commit{
+				{Ident: id, MetadataLocation: location, Intent: intent},
+			})
+
+			return err
+		},
+	)
 	if err != nil {
-		return Table{}, tableNameClash(s.handleFailedPointerWrite(ctx, err, location), id)
+		return Table{}, tableNameClash(err, id)
 	}
 
 	s.logFor(ctx).InfoContext(ctx, "table created",

@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"time"
 
 	"github.com/cockroachdb/pebble/v2"
+	"github.com/prometheus/client_golang/prometheus"
 	"go.etcd.io/raft/v3"
 	"go.etcd.io/raft/v3/raftpb"
 	"google.golang.org/protobuf/proto"
@@ -43,6 +45,8 @@ func (n *Node) failStop() {
 }
 
 func (n *Node) handleReady(rd raft.Ready) error {
+	defer n.metrics.observe(func(m *Metrics) prometheus.Histogram { return m.readyLoop }, time.Now())
+
 	n.updateSoftState(rd.SoftState)
 
 	if rd.HardState != nil {
@@ -57,17 +61,29 @@ func (n *Node) handleReady(rd raft.Ready) error {
 		}
 	}
 
+	saveStart := time.Now()
+
 	if err := n.storage.Save(rd.HardState, rd.Entries, rd.MustSync); err != nil {
 		return fmt.Errorf("saving raft state: %w", err)
+	}
+
+	if rd.MustSync {
+		n.metrics.observe(func(m *Metrics) prometheus.Histogram { return m.walFsync }, saveStart)
 	}
 
 	// 2. Send, only after the state the messages depend on is durable.
 	n.transport.Send(rd.Messages)
 
 	// 3. Apply.
+	applyStart := time.Now()
+
 	removed, err := n.applyCommitted(rd.CommittedEntries)
 	if err != nil {
 		return fmt.Errorf("applying entries: %w", err)
+	}
+
+	if len(rd.CommittedEntries) > 0 {
+		n.metrics.observe(func(m *Metrics) prometheus.Histogram { return m.applyBatch }, applyStart)
 	}
 
 	// 4. Confirm linearizable reads.
@@ -97,6 +113,10 @@ func (n *Node) updateSoftState(ss *raft.SoftState) {
 	n.state.Store(ss.RaftState)
 
 	if prev := n.leader.Swap(ss.Lead); prev != ss.Lead {
+		if ss.Lead != 0 {
+			n.metrics.leaderChanged()
+		}
+
 		n.log.Info("leader changed",
 			slog.Uint64("leader", ss.Lead),
 			slog.Uint64("previous", prev),
@@ -259,6 +279,7 @@ func (n *Node) maybeCompact() error {
 		return fmt.Errorf("compacting log to %d: %w", target, err)
 	}
 
+	n.metrics.compacted()
 	n.log.Debug("log compacted", slog.Uint64("up_to", target))
 
 	return nil
@@ -300,6 +321,7 @@ func (n *Node) applySnapshot(snap *raftpb.Snapshot) error {
 
 	n.sm.SetApplied(state)
 	n.storage.ApplySnapshot(meta)
+	n.metrics.snapshotApplied()
 	n.applied.set(meta.GetIndex())
 	n.lastCompactCheck = meta.GetIndex()
 

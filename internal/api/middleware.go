@@ -11,6 +11,9 @@ import (
 	"runtime/debug"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+
 	"echpochmak/internal/logger"
 )
 
@@ -22,7 +25,7 @@ const maxRequestIDLen = 128
 
 // withRequestLogging assigns a request ID, stores a logger tagged with it in
 // the request context, and writes one access log line per request.
-func withRequestLogging(base *slog.Logger, next http.Handler) http.Handler {
+func withRequestLogging(base *slog.Logger, m *Metrics, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 
@@ -32,6 +35,7 @@ func withRequestLogging(base *slog.Logger, next http.Handler) http.Handler {
 		}
 
 		w.Header().Set(HeaderRequestID, id)
+		trace.SpanFromContext(r.Context()).SetAttributes(attribute.String("http.request_id", id))
 
 		log := base.With(slog.String(logger.KeyRequestID, id))
 		route := &routeHolder{}
@@ -46,20 +50,29 @@ func withRequestLogging(base *slog.Logger, next http.Handler) http.Handler {
 			pattern = "unmatched"
 		}
 
+		elapsed := time.Since(start)
+		m.observe(r, pattern, rec.status, elapsed, route.idempotency)
+
 		level := slog.LevelInfo
 		if isProbe(r) {
 			level = slog.LevelDebug
 		}
 
-		log.LogAttrs(r.Context(), level, "http request",
+		attrs := []slog.Attr{
 			slog.String(logger.KeyMethod, r.Method),
 			slog.String(logger.KeyRoute, pattern),
 			slog.String(logger.KeyPath, r.URL.Path),
 			slog.Int(logger.KeyStatus, rec.status),
-			slog.Duration(logger.KeyDuration, time.Since(start)),
+			slog.Duration(logger.KeyDuration, elapsed),
 			slog.Int64(logger.KeyBytes, rec.bytes),
 			slog.String(logger.KeyRemote, r.RemoteAddr),
-		)
+		}
+
+		if route.idempotency != "" {
+			attrs = append(attrs, slog.String("idempotency", route.idempotency))
+		}
+
+		log.LogAttrs(r.Context(), level, "http request", attrs...)
 	})
 }
 
@@ -70,6 +83,16 @@ type routeKey struct{}
 // pattern the mux sets on its request is not visible to the logger directly.
 type routeHolder struct {
 	pattern string
+	// idempotency is what the Idempotency-Key protocol decided, if the
+	// request carried a key.
+	idempotency string
+}
+
+// setIdempotency records the protocol's decision for the request.
+func setIdempotency(r *http.Request, outcome string) {
+	if route, ok := r.Context().Value(routeKey{}).(*routeHolder); ok {
+		route.idempotency = outcome
+	}
 }
 
 // withRoute records the route pattern that mux matched. It must wrap the mux
@@ -80,6 +103,13 @@ func withRoute(mux http.Handler) http.Handler {
 
 		if route, ok := r.Context().Value(routeKey{}).(*routeHolder); ok {
 			route.pattern = r.Pattern
+		}
+
+		// Name the span after the route template, which is only known now.
+		if r.Pattern != "" {
+			span := trace.SpanFromContext(r.Context())
+			span.SetName(r.Pattern)
+			span.SetAttributes(attribute.String("http.route", r.Pattern))
 		}
 	})
 }
@@ -111,8 +141,9 @@ func withRecovery(next http.Handler) http.Handler {
 	})
 }
 
+// isProbe reports a request from monitoring, logged at debug level.
 func isProbe(r *http.Request) bool {
-	return r.URL.Path == pathHealthz || r.URL.Path == pathReadyz
+	return r.URL.Path == pathHealthz || r.URL.Path == pathReadyz || r.URL.Path == pathMetrics
 }
 
 func validRequestID(id string) bool {

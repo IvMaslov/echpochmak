@@ -314,6 +314,17 @@ func (s *Storage) ResetToSnapshot(b *pebble.Batch, meta *raftpb.SnapshotMetadata
 	return nil
 }
 
+// WriteRestored adds to b the raft state of a node restored from a snapshot
+// at meta: an empty log that starts after the snapshot, and hs. b belongs to
+// a database without raft state, which the restore creates.
+func WriteRestored(b *pebble.Batch, meta *raftpb.SnapshotMetadata, hs *raftpb.HardState) error {
+	if err := b.Set([]byte(keyTruncated), encodeTruncated(meta.GetIndex(), meta.GetTerm()), nil); err != nil {
+		return fmt.Errorf("writing truncation point: %w", err)
+	}
+
+	return setProto(b, []byte(keyHardState), hs)
+}
+
 // ApplySnapshot updates the in-memory view after the batch from
 // [Storage.ResetToSnapshot] was committed.
 func (s *Storage) ApplySnapshot(meta *raftpb.SnapshotMetadata) {

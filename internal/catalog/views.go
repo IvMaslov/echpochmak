@@ -82,14 +82,29 @@ func (s *Service) CreateView(ctx context.Context, in CreateViewInput) (View, err
 		return View{}, err
 	}
 
-	raw, err := s.writeViewMetadata(ctx, location, md)
-	if err != nil {
-		return View{}, err
-	}
+	var (
+		raw []byte
+		ptr store.Pointer
+	)
 
-	ptr, err := s.store.CommitView(ctx, store.Commit{Ident: in.Ident, MetadataLocation: location})
+	err = s.writeAndCommit(ctx, in.Ident, location,
+		func() (err error) {
+			raw, err = s.writeViewMetadata(ctx, location, md)
+
+			return err
+		},
+		func(intent store.IntentRef) (err error) {
+			ptr, err = s.store.CommitView(ctx, store.Commit{
+				Ident:            in.Ident,
+				MetadataLocation: location,
+				Intent:           intent,
+			})
+
+			return err
+		},
+	)
 	if err != nil {
-		return View{}, viewNameClash(s.handleFailedPointerWrite(ctx, err, location), in.Ident)
+		return View{}, viewNameClash(err, in.Ident)
 	}
 
 	s.logFor(ctx).InfoContext(ctx, "view created",
@@ -181,7 +196,7 @@ func (s *Service) ReplaceView(ctx context.Context, in ReplaceViewInput) (View, e
 
 	entity := slog.String(logger.KeyView, in.Ident.String())
 
-	v, attempts, err := retryOnRace(ctx, s, entity, func() (View, error) {
+	v, attempts, err := retryOnRace(ctx, s, kindView, entity, func(ctx context.Context) (View, error) {
 		return s.replaceViewOnce(ctx, in)
 	})
 	if err != nil {
@@ -240,18 +255,27 @@ func (s *Service) replaceViewOnce(ctx context.Context, in ReplaceViewInput) (Vie
 		return View{}, err
 	}
 
-	written, err := s.writeViewMetadata(ctx, location, res.Metadata)
+	var written []byte
+
+	err = s.writeAndCommit(ctx, in.Ident, location,
+		func() (err error) {
+			written, err = s.writeViewMetadata(ctx, location, res.Metadata)
+
+			return err
+		},
+		func(intent store.IntentRef) error {
+			_, err := s.store.CommitView(ctx, store.Commit{
+				Ident:            in.Ident,
+				ExpectedVersion:  ptr.Version,
+				MetadataLocation: location,
+				Intent:           intent,
+			})
+
+			return err
+		},
+	)
 	if err != nil {
 		return View{}, err
-	}
-
-	_, err = s.store.CommitView(ctx, store.Commit{
-		Ident:            in.Ident,
-		ExpectedVersion:  ptr.Version,
-		MetadataLocation: location,
-	})
-	if err != nil {
-		return View{}, s.handleFailedPointerWrite(ctx, err, location)
 	}
 
 	return View{Ident: in.Ident, MetadataLocation: location, MetadataJSON: written}, nil

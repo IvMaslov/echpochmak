@@ -14,6 +14,7 @@ run:
     - e2e
     - kvchaos
     - ha
+    - dr
   modules-download-mode: readonly
 
 issues:
@@ -230,6 +231,7 @@ linters:
         - .WithMessagef(
         - .WithStack(
         - .SendAndClose(
+        - .Send(
 
   exclusions:
     generated: strict

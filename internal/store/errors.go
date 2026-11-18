@@ -27,14 +27,37 @@ var (
 	ErrCommitConflict = errors.New("commit conflict")
 	// ErrUnavailable means the store cannot serve the request right now, for
 	// example because a cluster has no leader. The request may be retried.
+	// On its own it means a write was certainly not applied.
 	ErrUnavailable = errors.New("store unavailable")
+	// ErrOutcomeUnknown means a write may or may not have been applied: it
+	// was sent, and then the store became unreachable. Errors that match it
+	// also match [ErrUnavailable], so callers that only need "the store is
+	// unavailable" keep working; callers that clean up after a failed write
+	// must check ErrOutcomeUnknown first.
+	ErrOutcomeUnknown = errors.New("store write outcome unknown")
 	// ErrInvalidArgument means the request is malformed: a bad identifier,
 	// page token or commit.
 	ErrInvalidArgument = errors.New("invalid argument")
 	// ErrPurgeTaskChanged means a purge task was claimed, renewed or completed
 	// by someone else since it was read, or no longer exists.
 	ErrPurgeTaskChanged = errors.New("purge task changed")
+	// ErrIntentChanged means a commit intent was condemned or released since
+	// it was read, or no longer exists. A commit naming it fails with this
+	// error, and must be retried with a new intent.
+	ErrIntentChanged = errors.New("commit intent changed")
 )
+
+// OutcomeUnknown returns an error that matches both [ErrOutcomeUnknown] and
+// [ErrUnavailable], wrapping cause.
+func OutcomeUnknown(cause error) error {
+	return fmt.Errorf("%w: %w: %w", ErrOutcomeUnknown, ErrUnavailable, cause)
+}
+
+// IsDefinitelyNotApplied reports whether err says that a write certainly did
+// not happen because the store was unavailable.
+func IsDefinitelyNotApplied(err error) bool {
+	return errors.Is(err, ErrUnavailable) && !errors.Is(err, ErrOutcomeUnknown)
+}
 
 // CommitConflictError reports a pointer that is not at the version a commit
 // expected. It matches [ErrCommitConflict] with [errors.Is].

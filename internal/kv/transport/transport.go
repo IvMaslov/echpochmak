@@ -53,6 +53,9 @@ type Config struct {
 	SnapshotChunkBytes     int
 	SnapshotTimeout        time.Duration
 	Logger                 *slog.Logger
+	// Metrics counts dropped messages and sent snapshots; nil counts
+	// nothing.
+	Metrics *Metrics
 }
 
 func (c *Config) setDefaults() {

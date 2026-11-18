@@ -67,6 +67,15 @@ type Catalog struct {
 	PurgeLease time.Duration
 	// PurgeInterval is how often an idle purge worker scans the queue.
 	PurgeInterval time.Duration
+	// OrphanCleanup runs the janitor that deletes the metadata files of
+	// commits that never landed. Turn it off after a restore until the
+	// restore report is done.
+	OrphanCleanup bool
+	// OrphanInterval is the pause between janitor sweeps.
+	OrphanInterval time.Duration
+	// OrphanGrace is how old a commit intent must be before the janitor
+	// condemns it; zero means twice the HTTP write timeout.
+	OrphanGrace time.Duration
 }
 
 // HTTP configures the HTTP server.
@@ -86,6 +95,8 @@ type HTTP struct {
 	DrainDelay time.Duration
 	// Docs serves the Swagger UI and the served spec.
 	Docs bool
+	// Metrics serves Prometheus metrics at /metrics.
+	Metrics bool
 }
 
 // Store selects and configures the store backend.
@@ -150,6 +161,14 @@ func (s Secret) LogValue() slog.Value {
 // Load parses args (without the program name) and falls back to environment
 // variables, read with getenv, for flags not given on the command line.
 func Load(args []string, getenv func(string) string) (Config, error) {
+	cfg, _, err := LoadWithArgs(args, getenv)
+
+	return cfg, err
+}
+
+// LoadWithArgs is [Load] for tools that share the catalog-server flags and
+// take a command after them: it also returns the arguments after the flags.
+func LoadWithArgs(args []string, getenv func(string) string) (Config, []string, error) {
 	var cfg Config
 
 	fs := flag.NewFlagSet("catalog-server", flag.ContinueOnError)
@@ -157,18 +176,18 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 	register(fs, &cfg)
 
 	if err := fs.Parse(args); err != nil {
-		return Config{}, fmt.Errorf("parsing flags: %w", err)
+		return Config{}, nil, fmt.Errorf("parsing flags: %w", err)
 	}
 
 	if err := applyEnv(fs, EnvPrefix, getenv); err != nil {
-		return Config{}, err
+		return Config{}, nil, err
 	}
 
 	if err := cfg.Validate(); err != nil {
-		return Config{}, err
+		return Config{}, nil, err
 	}
 
-	return cfg, nil
+	return cfg, fs.Args(), nil
 }
 
 // Usage returns the help text of all catalog-server flags.
@@ -187,7 +206,7 @@ func register(fs *flag.FlagSet, cfg *Config) {
 		"time to read request headers",
 	)
 	fs.DurationVar(&cfg.HTTP.ReadTimeout, "http-read-timeout", 30*time.Second, "time to read a whole request")
-	fs.DurationVar(&cfg.HTTP.WriteTimeout, "http-write-timeout", 60*time.Second, "time to write a response")
+	fs.DurationVar(&cfg.HTTP.WriteTimeout, "http-write-timeout", 90*time.Second, "time to write a response")
 	fs.DurationVar(&cfg.HTTP.IdleTimeout, "http-idle-timeout", 120*time.Second, "keep-alive idle timeout")
 	fs.DurationVar(&cfg.HTTP.ShutdownTimeout, "http-shutdown-timeout", 20*time.Second, "graceful shutdown timeout")
 	fs.Int64Var(&cfg.HTTP.MaxBodyBytes, "http-max-body-bytes", 16<<20, "maximum request body size in bytes")
@@ -215,7 +234,14 @@ func register(fs *flag.FlagSet, cfg *Config) {
 		"how long a purge worker's claim on a task lasts; renewed between delete batches")
 	fs.DurationVar(&cfg.Catalog.PurgeInterval, "purge-interval", 10*time.Second,
 		"how often an idle purge worker scans the queue, jittered")
+	fs.BoolVar(&cfg.Catalog.OrphanCleanup, "orphan-cleanup", true,
+		"delete the metadata files of commits that never landed; turn off after a restore until the report is done")
+	fs.DurationVar(&cfg.Catalog.OrphanInterval, "orphan-interval", time.Minute,
+		"pause between sweeps of the orphan janitor, jittered")
+	fs.DurationVar(&cfg.Catalog.OrphanGrace, "orphan-grace", 0,
+		"age at which a commit intent counts as abandoned; 0 means twice http-write-timeout")
 	fs.BoolVar(&cfg.HTTP.Docs, "docs", true, "serve the Swagger UI at /docs and the spec at /openapi.json")
+	fs.BoolVar(&cfg.HTTP.Metrics, "metrics", true, "serve Prometheus metrics at /metrics")
 
 	fs.StringVar(&cfg.Store.Backend, "store-backend", StoreMemory, "store backend: memory or raft")
 	fs.Func("kv-endpoints", "KV cluster client endpoints, comma-separated (raft backend)", func(v string) error {
@@ -228,21 +254,27 @@ func register(fs *flag.FlagSet, cfg *Config) {
 	fs.DurationVar(&cfg.Store.KVRequestTimeout, "kv-request-timeout", 5*time.Second,
 		"timeout of one store call, KV client retries included")
 
-	fs.StringVar(&cfg.S3.Endpoint, "s3-endpoint", "", "S3 endpoint URL; empty for AWS")
-	fs.StringVar(&cfg.S3.Region, "s3-region", "us-east-1", "S3 region")
+	registerS3Access(fs, &cfg.S3)
 	fs.StringVar(
 		&cfg.S3.Warehouse,
 		"s3-warehouse",
 		"s3://warehouse/",
 		"warehouse location for new tables: s3://, s3a://, file:// or mem:// URL",
 	)
-	fs.StringVar(&cfg.S3.AccessKeyID, "s3-access-key-id", "", "S3 access key ID")
+}
+
+// registerS3Access registers the flags that reach S3: endpoint, region,
+// credentials and addressing.
+func registerS3Access(fs *flag.FlagSet, s3 *S3) {
+	fs.StringVar(&s3.Endpoint, "s3-endpoint", "", "S3 endpoint URL; empty for AWS")
+	fs.StringVar(&s3.Region, "s3-region", "us-east-1", "S3 region")
+	fs.StringVar(&s3.AccessKeyID, "s3-access-key-id", "", "S3 access key ID")
 	fs.Func("s3-secret-access-key", "S3 secret access key", func(v string) error {
-		cfg.S3.SecretAccessKey = Secret(v)
+		s3.SecretAccessKey = Secret(v)
 
 		return nil
 	})
-	fs.BoolVar(&cfg.S3.PathStyle, "s3-path-style", false, "use path-style S3 URLs (required by MinIO)")
+	fs.BoolVar(&s3.PathStyle, "s3-path-style", false, "use path-style S3 URLs (required by MinIO)")
 }
 
 // applyEnv sets every flag that was not given on the command line from its
@@ -347,8 +379,8 @@ func (cfg Config) Validate() error {
 }
 
 // commitStoreCalls is how many store calls one commit attempt makes: read the
-// pointer, then swap it.
-const commitStoreCalls = 2
+// pointer, record the commit intent, then swap the pointer.
+const commitStoreCalls = 3
 
 func (cfg Config) validateStore() []error {
 	var errs []error
@@ -412,7 +444,23 @@ func (c Catalog) validate() []error {
 			c.PurgeLease, c.PurgeInterval))
 	}
 
+	if c.OrphanInterval <= 0 || c.OrphanGrace < 0 {
+		errs = append(errs, fmt.Errorf("orphan-interval must be positive and orphan-grace not negative, got %s and %s",
+			c.OrphanInterval, c.OrphanGrace))
+	}
+
 	return errs
+}
+
+// OrphanGrace returns the age at which the janitor condemns a commit intent:
+// the configured grace, or twice the HTTP write timeout, beyond which no
+// request is still running.
+func (cfg Config) OrphanGrace() time.Duration {
+	if cfg.Catalog.OrphanGrace > 0 {
+		return cfg.Catalog.OrphanGrace
+	}
+
+	return 2 * cfg.HTTP.WriteTimeout
 }
 
 // LogValue implements [slog.LogValuer]. Secrets are redacted.
@@ -428,6 +476,7 @@ func (cfg Config) LogValue() slog.Value {
 			slog.Int64("max_body_bytes", cfg.HTTP.MaxBodyBytes),
 			slog.Duration("drain_delay", cfg.HTTP.DrainDelay),
 			slog.Bool("docs", cfg.HTTP.Docs),
+			slog.Bool("metrics", cfg.HTTP.Metrics),
 		),
 		slog.Group("catalog",
 			slog.String("name", cfg.Catalog.Name),
@@ -437,6 +486,9 @@ func (cfg Config) LogValue() slog.Value {
 			slog.Int("purge_workers", cfg.Catalog.PurgeWorkers),
 			slog.Duration("purge_lease", cfg.Catalog.PurgeLease),
 			slog.Duration("purge_interval", cfg.Catalog.PurgeInterval),
+			slog.Bool("orphan_cleanup", cfg.Catalog.OrphanCleanup),
+			slog.Duration("orphan_interval", cfg.Catalog.OrphanInterval),
+			slog.Duration("orphan_grace", cfg.OrphanGrace()),
 		),
 		slog.Group("log",
 			slog.String("min_level", cfg.Log.Level.String()),

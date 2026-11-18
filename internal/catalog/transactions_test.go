@@ -128,7 +128,7 @@ func TestTransactionUnknownOutcomeKeepsFiles(t *testing.T) {
 			written = append(written, c.MetadataLocation)
 		}
 
-		return nil, fmt.Errorf("%w: connection reset", store.ErrUnavailable)
+		return nil, store.OutcomeUnknown(errors.New("connection reset"))
 	})
 
 	err := f.svc.CommitTransaction(t.Context(), []catalog.CommitInput{

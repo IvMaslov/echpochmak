@@ -20,7 +20,7 @@ LDFLAGS    := -s -w \
 	-X echpochmak/internal/version.commit=$(COMMIT) \
 	-X echpochmak/internal/version.buildDate=$(BUILD_DATE)
 
-BINARIES := catalog-server kv-node kvctl
+BINARIES := catalog-server catalogctl kv-node kvctl kv-backup
 
 # Iceberg REST spec, pinned by commit. Bump SPEC_COMMIT and run `make spec-update`.
 SPEC_COMMIT := 79bc69a51da6d95ccd6da6d46ef156c74e30b8cf
@@ -163,6 +163,35 @@ ha-e2e: deployments/compose/.env ## Run the HA milestone suite and the Trino sui
 		go test -tags ha -count=1 -v -timeout 30m ./test/ha/ || status=$$?; \
 		[ $$status -ne 0 ] || go test -tags e2e -count=1 -v ./test/e2e/ || status=$$?; \
 		$(HA_COMPOSE) down -v --remove-orphans; \
+		exit $$status
+
+# The disaster-resistance stack: the HA stack with 5 kv-nodes in 3 zones,
+# kv-backup, Prometheus, Grafana and Jaeger.
+# Absolute paths: the drills run docker compose from test/ha.
+DR_COMPOSE := docker compose -f $(CURDIR)/deployments/compose/docker-compose.yaml \
+	-f $(CURDIR)/deployments/compose/docker-compose.ha.yaml \
+	-f $(CURDIR)/deployments/compose/docker-compose.zones.yaml \
+	-f $(CURDIR)/deployments/compose/docker-compose.obs.yaml \
+	--env-file $(CURDIR)/deployments/compose/.env --profile kv
+
+.PHONY: obs-up
+obs-up: deployments/compose/.env ## Start the HA stack with 5 kv-nodes in 3 zones, kv-backup, Prometheus, Grafana, Jaeger
+	$(DR_COMPOSE) up -d --build --wait
+
+.PHONY: obs-down
+obs-down: deployments/compose/.env ## Remove the observability stack, its containers and volumes
+	$(DR_COMPOSE) down -v --remove-orphans
+
+.PHONY: dr-e2e
+dr-e2e: deployments/compose/.env ## Run the disaster drills (zone loss, backups, restore, orphans, observability), then remove the stack
+	$(DR_COMPOSE) up -d --build --wait
+	status=0; \
+		DR_COMPOSE="$(DR_COMPOSE)" go test -tags dr -count=1 -v -timeout 60m ./test/ha/ || status=$$?; \
+		[ $$status -eq 0 ] || { mkdir -p build; $(DR_COMPOSE) logs --no-color > build/dr-logs.txt 2>&1; \
+			echo "container logs: build/dr-logs.txt"; }; \
+		$(DR_COMPOSE) down -v --remove-orphans; \
+		docker rm -f echpochmak-kv-old >/dev/null 2>&1 || true; \
+		docker volume rm -f echpochmak_kv1-old >/dev/null 2>&1 || true; \
 		exit $$status
 
 # run-rck runs the REST Compatibility Kit on the stack that $(1) starts with

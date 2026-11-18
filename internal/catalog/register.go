@@ -36,7 +36,7 @@ func (s *Service) RegisterTable(ctx context.Context, in RegisterTableInput) (Tab
 
 	entity := slog.String(logger.KeyTable, in.Ident.String())
 
-	_, _, err = retryOnRace(ctx, s, entity, func() (struct{}, error) {
+	_, _, err = retryOnRace(ctx, s, kindRegister, entity, func(ctx context.Context) (struct{}, error) {
 		return struct{}{}, s.registerOnce(ctx, in)
 	})
 	if err != nil {

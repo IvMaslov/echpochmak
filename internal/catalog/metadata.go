@@ -94,19 +94,24 @@ func (s *Service) writeMetadata(ctx context.Context, location string, md table.M
 	return raw, nil
 }
 
-// deleteFile removes a file the catalog no longer needs. Failures only leave
-// an orphan behind, so they are logged and otherwise ignored. The deletion
-// runs even if the request was cancelled.
-func (s *Service) deleteFile(ctx context.Context, location, reason string) {
+// deleteFile removes a file the catalog no longer needs and reports whether
+// it is gone. Failures only leave an orphan behind, so they are logged and
+// otherwise ignored. The deletion runs even if the request was cancelled.
+func (s *Service) deleteFile(ctx context.Context, location, reason string) bool {
 	ctx = context.WithoutCancel(ctx)
 
 	if err := s.files.Delete(ctx, location); err != nil {
+		s.metrics.deleteFailed()
 		s.logFor(ctx).WarnContext(ctx, "deleting metadata file failed",
 			logger.Err(err),
 			slog.String(logger.KeyLocation, location),
 			slog.String(logger.KeyReason, reason),
 		)
+
+		return false
 	}
+
+	return true
 }
 
 // newMetadataLocation returns the location of the next metadata file of md,

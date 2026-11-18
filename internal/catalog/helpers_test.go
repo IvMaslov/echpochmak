@@ -64,6 +64,22 @@ func (m *memFiles) Delete(_ context.Context, location string) error {
 	return nil
 }
 
+// List implements catalog.Lister: the files under prefix, sorted.
+func (m *memFiles) List(_ context.Context, prefix string) ([]fileio.ObjectInfo, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	out := []fileio.ObjectInfo{}
+
+	for _, location := range slices.Sorted(maps.Keys(m.files)) {
+		if strings.HasPrefix(location, prefix) {
+			out = append(out, fileio.ObjectInfo{Location: location, Size: int64(len(m.files[location]))})
+		}
+	}
+
+	return out, nil
+}
+
 // list returns the sorted locations of all files.
 func (m *memFiles) list() []string {
 	m.mu.Lock()

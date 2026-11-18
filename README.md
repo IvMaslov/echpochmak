@@ -7,7 +7,8 @@ server, with catalog state kept in a raft-replicated key-value store.
   API. Run as many replicas as you like behind a load balancer.
 - **kv-node** is one node of a raft cluster, built on `go.etcd.io/raft/v3`,
   that stores namespaces, table and view pointers and the purge queue;
-  **kvctl** administers it.
+  **kvctl** administers it, **kv-backup** backs it up to object storage.
+- **catalogctl** compares the catalog with object storage after a restore.
 - **Store** is the interface between them (`internal/store`). An in-memory
   implementation is used for tests and local development.
 
@@ -17,7 +18,7 @@ Design docs and phase plans are in [`arch/`](arch/).
 
 ## Status
 
-Phases 1–4 are done:
+Phases 1–5 are done:
 - Namespaces, tables and views work end to end with Trino and PyIceberg,
   against MinIO.
 - Multi-table transactions (`transactions/commit`), register, register-view
@@ -32,6 +33,14 @@ Phases 1–4 are done:
 - Iceberg's own REST Compatibility Kit passes, with a short list of
   documented exclusions (`test/rck/exclusions.txt`).
 - A Swagger UI at `/docs` shows the served endpoints.
+- The KV cluster is backed up to S3 on a schedule and restored with one
+  documented procedure; a 5-node cluster in 3 zones survives losing a zone.
+- Files of commits that never landed are cleaned up by a janitor.
+- Every component exports Prometheus metrics and OpenTelemetry traces; a
+  compose overlay adds Prometheus, Grafana and Jaeger.
+
+How to run it in production, and what to do when something fails, is in
+[`docs/operations.md`](docs/operations.md).
 
 Not served, and not advertised to clients: OAuth tokens, credential vending,
 S3 request signing, server-side scan planning and functions. With the default
@@ -46,7 +55,7 @@ in-memory backend, catalog state is lost on restart.
 
 ```sh
 make help          # list all targets
-make build         # build bin/catalog-server, bin/kv-node and bin/kvctl
+make build         # build bin/: catalog-server, catalogctl, kv-node, kvctl, kv-backup
 make test          # run tests with the race detector
 make lint          # golangci-lint v2 (installed into ./bin on first use)
 make ci            # tidy, generated-code check, lint, test, build
@@ -56,6 +65,8 @@ make kv-chaos      # 3-node KV cluster in docker, linearizability under chaos
 make kv-torture    # longer in-process linearizability run, random seed
 make ha-up         # HA stack: 3 kv-nodes, 2 catalogs behind HAProxy, Trino, PyIceberg
 make ha-e2e        # HA milestone suite under failures, then remove the stack
+make obs-up        # HA stack with 5 kv-nodes in 3 zones, kv-backup, Prometheus, Grafana, Jaeger
+make dr-e2e        # disaster drills on that stack, then remove it
 make rck           # optional: Iceberg's REST Compatibility Kit, one in-memory catalog
 make rck-ha        # optional: the same against the HA stack
 ```
@@ -175,6 +186,32 @@ replicas and the raft leader, and checks that no acknowledged row is lost or
 duplicated. `make ha-down` removes the stack, its containers and its
 volumes.
 
+## Disaster resistance and observability
+
+`make obs-up` starts the HA stack with two more overlays: five kv-nodes in
+three zones (`docker-compose.zones.yaml`) with `kv-backup`, and Prometheus,
+Grafana and Jaeger (`docker-compose.obs.yaml`):
+
+| | |
+|---|---|
+| Grafana, the *echpochmak overview* dashboard | http://localhost:3000 |
+| Prometheus | http://localhost:9090 |
+| Jaeger | http://localhost:16686 |
+
+```sh
+docker exec echpochmak-kv-backup-1 /kv-backup list      # backups in the bucket
+bin/kvctl -endpoints localhost:23791,localhost:23795 status   # zones, leader
+bin/kvctl snapshot save backup.snap                     # a snapshot by hand
+docker exec echpochmak-catalog-a-1 /catalogctl restore-report
+```
+
+`make dr-e2e` runs the disaster drills on that stack: losing a zone, then
+the quorum; orphans under faults; metrics and traces; backups and
+retention; destroying every kv-node and restoring from the newest backup,
+with the restore report and roll-forward; and the unsafe recovery from one
+surviving node. The runbooks for each failure are in
+[`docs/operations.md`](docs/operations.md).
+
 ## REST Compatibility Kit
 
 The RCK is Iceberg's own test suite for REST servers: Java's `CatalogTests`
@@ -197,10 +234,13 @@ volume. Tests the server deliberately fails are listed with their reasons in
 
 ## Configuration
 
-`catalog-server -help` and `kv-node -help` list every flag. Each flag can also be set with an
-environment variable: `-http-addr` becomes `ECHPOCHMAK_HTTP_ADDR` for
-catalog-server, and `-data-dir` becomes `ECHPOCHMAK_KV_DATA_DIR` for kv-node. A flag on
-the command line wins over the environment.
+`catalog-server -help`, `kv-node -help` and `kv-backup -help` list every
+flag. Each flag can also be set with an environment variable: `-http-addr`
+becomes `ECHPOCHMAK_HTTP_ADDR` for catalog-server, `-data-dir` becomes
+`ECHPOCHMAK_KV_DATA_DIR` for kv-node, and `-location` becomes
+`ECHPOCHMAK_BACKUP_LOCATION` for kv-backup. A flag on the command line wins
+over the environment. Tracing is configured with the standard `OTEL_*`
+variables and is off unless `OTEL_EXPORTER_OTLP_ENDPOINT` is set.
 
 Notable settings:
 
@@ -214,11 +254,19 @@ Notable settings:
 | `-store-backend` | `memory` | `memory`, or `raft` for the replicated KV store |
 | `-kv-endpoints` | — | KV client endpoints, comma-separated (raft backend) |
 | `-kv-attempt-timeout` / `-kv-request-timeout` | `2s` / `5s` | One KV attempt / one store call with retries; must nest under `-http-write-timeout` (checked at startup) |
+| `-http-write-timeout` | `90s` | Must exceed `(commit-retries + 1) × 3 × kv-request-timeout` |
 | `-idempotency-lifetime` | `30m` | How long an `Idempotency-Key` is honoured; `0` disables it |
 | `-http-drain-delay` | `0` | On shutdown, report unready this long before draining; set it to the load balancer's health-check window |
 | `-purge-workers` | `2` | Purge tasks this replica runs at once; `0` leaves them to other replicas |
 | `-purge-lease` / `-purge-interval` | `2m` / `10s` | A purge worker's claim on a task; how often an idle worker scans the queue |
 | `-docs` | `true` | Serve the Swagger UI at `/docs` and the spec at `/openapi.json` |
+| `-metrics` | `true` | Serve Prometheus metrics at `/metrics` |
+| `-orphan-cleanup` | `true` | Run the janitor that deletes files of commits that never landed; off after a restore until the report is done |
+| `-orphan-interval` / `-orphan-grace` | `1m` / twice the write timeout | Janitor sweeps; age at which an intent counts as abandoned |
+| kv-node `-zone` | — | Placement label, reported by `kvctl status` and the metrics |
+| kv-node `-listen-metrics` | `:2381` | `/metrics`, `/healthz`, `/readyz` |
+| kv-backup `-location` | — | Where backups go, such as `s3://backups/kv` |
+| kv-backup `-interval` / `-keep-last` / `-keep-daily` | `5m` / `48` / `14` | Schedule and retention |
 
 ## Layout
 
@@ -229,24 +277,33 @@ internal/api/         HTTP layer; gen/ holds generated code, swaggerui/ the
                       vendored Swagger UI
 internal/catalog/     catalog operations: tables, views, transactions,
                       register, the purge worker
-internal/fileio/      object storage access and the metadata cache
+internal/fileio/      object storage access, the metadata cache, its metrics
+                      and traces
 internal/store/       Store interface, types, errors; storetest/ contract suite
 internal/store/memstore/
 internal/store/raftstore/  Store on the KV cluster
+internal/store/instrumented/  Store decorator with metrics and traces
+internal/backup/      KV backups in object storage: schedule, retention,
+                      verification
 internal/idempotency/ Idempotency-Key protocol, memory and KV stores
 api/kv/               KV cluster protocol (protobuf, buf config)
 internal/kv/          KV cluster: kvpb (generated), statemachine, raftlog,
-                      node, transport, server, client, daemon, kvtest
+                      node, transport, server, client, daemon, kvtest,
+                      snapshot (the backup file format)
 internal/config/      flags and environment
-internal/logger/      slog setup and request-scoped loggers
+internal/logger/      slog setup, request-scoped loggers, trace IDs in logs
+internal/metrics/     the Prometheus registry every binary shares
+internal/telemetry/   OpenTelemetry setup from OTEL_* variables
 internal/version/     build info (set via -ldflags)
 internal/tools/       code-generation helpers
 test/conformance/     in-process tests through iceberg-go's REST client
 test/e2e/             Trino end-to-end tests (build tag e2e)
 test/kvchaos/         KV linearizability under docker chaos (build tag kvchaos)
-test/ha/              HA milestone suite (build tag ha), PyIceberg writer
+test/ha/              HA milestone suite (build tag ha), disaster drills
+                      (build tag dr), PyIceberg writer
 test/rck/             REST Compatibility Kit exclusions
 build/                Dockerfiles
 deployments/compose/  local environment
 arch/                 design docs, plans, ADRs
+docs/                 operator's guide
 ```

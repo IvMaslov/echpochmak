@@ -155,6 +155,12 @@ type Commit struct {
 	Ident            Ident
 	ExpectedVersion  Version
 	MetadataLocation string
+	// Intent is the commit intent that recorded MetadataLocation before the
+	// file was written; zero for none. The commit fails with
+	// [ErrIntentChanged] unless the intent is still at its version, and
+	// removes the intent atomically with the pointer swap. Every commit of
+	// one call must name the same intent, or none.
+	Intent IntentRef
 }
 
 // IsCreate reports whether c creates a new pointer.
@@ -176,7 +182,29 @@ func (c Commit) Validate() error {
 		return fmt.Errorf("%w: empty metadata location for %q", ErrInvalidArgument, c.Ident.String())
 	}
 
+	if !c.Intent.IsZero() && (c.Intent.ID == "" || c.Intent.Version <= 0) {
+		return fmt.Errorf("%w: malformed intent for %q", ErrInvalidArgument, c.Ident.String())
+	}
+
 	return nil
+}
+
+// CommitsIntent returns the intent that commits name, which must be the same
+// for all of them; zero if they name none.
+func CommitsIntent(commits []Commit) (IntentRef, error) {
+	if len(commits) == 0 {
+		return IntentRef{}, nil
+	}
+
+	ref := commits[0].Intent
+
+	for _, c := range commits[1:] {
+		if c.Intent != ref {
+			return IntentRef{}, fmt.Errorf("%w: commits of one call name different intents", ErrInvalidArgument)
+		}
+	}
+
+	return ref, nil
 }
 
 // PropertiesUpdate sets and removes namespace properties. A key must not
@@ -263,6 +291,71 @@ func NewPurgeTaskID() (string, error) {
 	id, err := uuid.NewV7()
 	if err != nil {
 		return "", fmt.Errorf("generating a purge task ID: %w", err)
+	}
+
+	return id.String(), nil
+}
+
+// Intent records the metadata files that a commit attempt is about to write,
+// before it writes them. A successful commit removes its intent in the same
+// atomic write that moves the pointers, so an intent that outlives its
+// attempt names files that no pointer leads to: orphans, which the janitor
+// deletes. See arch/phase5/plan.md (D5).
+type Intent struct {
+	// ID identifies the intent; the store assigns it.
+	ID string
+	// Locations are the metadata files the attempt writes.
+	Locations []string
+	// Idents are the tables or views being committed, for logs.
+	Idents []Ident
+	// Owner names the replica that created the intent, for logs.
+	Owner string
+	// Created is when the store recorded the intent.
+	Created time.Time
+	// Condemned marks an intent that the janitor is deleting the files of. A
+	// commit naming it can no longer succeed.
+	Condemned bool
+	// Version changes when the intent is condemned; commits, condemning and
+	// releasing compare it.
+	Version Version
+}
+
+// Validate reports whether i can be created: it names at least one
+// location, and none is empty.
+func (i Intent) Validate() error {
+	if len(i.Locations) == 0 {
+		return fmt.Errorf("%w: an intent needs at least one location", ErrInvalidArgument)
+	}
+
+	if slices.Contains(i.Locations, "") {
+		return fmt.Errorf("%w: empty intent location", ErrInvalidArgument)
+	}
+
+	return nil
+}
+
+// Ref returns the reference that commits and releases use.
+func (i Intent) Ref() IntentRef {
+	return IntentRef{ID: i.ID, Version: i.Version}
+}
+
+// IntentRef names an intent at one version.
+type IntentRef struct {
+	ID      string
+	Version Version
+}
+
+// IsZero reports whether r names no intent.
+func (r IntentRef) IsZero() bool {
+	return r == IntentRef{}
+}
+
+// NewIntentID returns a new intent ID: a UUIDv7 string, so sorting IDs sorts
+// intents by creation time.
+func NewIntentID() (string, error) {
+	id, err := uuid.NewV7()
+	if err != nil {
+		return "", fmt.Errorf("generating an intent ID: %w", err)
 	}
 
 	return id.String(), nil

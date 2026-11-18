@@ -71,6 +71,7 @@ func (p *peer) enqueue(h Handler, msg *raftpb.Message) {
 	select {
 	case p.queue <- msg:
 	default:
+		p.t.cfg.Metrics.droppedMessage(p.id)
 		h.ReportUnreachable(p.id)
 	}
 }

@@ -1,4 +1,4 @@
-//go:build ha
+//go:build ha || dr
 
 package ha_test
 
@@ -20,10 +20,10 @@ import (
 const lbPort = "8181"
 
 // txDeadline bounds the retries of one transaction. It must outlast an
-// idempotency lease, twice the HTTP write timeout (2 x 60 s): a transaction
+// idempotency lease, twice the HTTP write timeout (2 x 90 s): a transaction
 // whose replica died while holding its key's claim is "in progress" (503)
 // until the lease expires and another replica takes the claim over.
-const txDeadline = 150 * time.Second
+const txDeadline = 200 * time.Second
 
 func (s *stack) files() fileio.FileIO {
 	return fileio.NewIceberg(s.t.Context(), map[string]string{

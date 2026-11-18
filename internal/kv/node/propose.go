@@ -6,9 +6,13 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"go.etcd.io/raft/v3"
 	"go.etcd.io/raft/v3/raftpb"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/protobuf/proto"
 
 	"echpochmak/internal/kv/kvpb"
@@ -45,29 +49,53 @@ func (n *Node) Propose(ctx context.Context, p *kvpb.Proposal) (*kvpb.Result, err
 			ErrInvalidRequest, len(data), n.cfg.MaxRequestBytes)
 	}
 
+	ctx, span := n.cfg.Tracer.Start(ctx, "kv.propose", trace.WithAttributes(attribute.Int("kv.bytes", len(data))))
+	defer span.End()
+
 	ctx, cancel := context.WithTimeout(ctx, n.cfg.RequestTimeout)
 	defer cancel()
 
+	start := time.Now()
 	key := string(p.GetRequestId())
 	ch := n.proposals.register(key)
 	defer n.proposals.cancel(key, ch)
 
 	if err := n.raft.Propose(ctx, data); err != nil {
-		return nil, proposeError(err)
+		err = proposeError(err)
+		n.metrics.proposal(proposalOutcome(err), start)
+
+		return nil, err
 	}
 
 	select {
 	case res := <-ch:
 		if res.GetError() != "" {
+			n.metrics.proposal(proposalInvalid, start)
+
 			return nil, fmt.Errorf("%w: %s", ErrInvalidRequest, res.GetError())
 		}
 
+		n.metrics.proposal(proposalApplied, start)
+
 		return res, nil
 	case <-ctx.Done():
+		n.metrics.proposal(proposalTimedOut, start)
+
 		return nil, fmt.Errorf("%w: %w", ErrOutcomeUnknown, ctx.Err())
 	case <-n.stopc:
+		n.metrics.proposal(proposalTimedOut, start)
+
 		return nil, fmt.Errorf("%w: node stopped", ErrOutcomeUnknown)
 	}
+}
+
+// proposalOutcome names the result of a proposal that raft did not accept.
+func proposalOutcome(err error) string {
+	if errors.Is(err, ErrUnavailable) {
+		return proposalDropped
+	}
+
+	return proposalTimedOut
 }
 
 // proposeError classifies a failed raft.Propose. Only a dropped proposal
@@ -109,9 +137,13 @@ func (n *Node) Read(ctx context.Context, serializable bool, fn func(*statemachin
 // waitReadIndex confirms with a quorum that this node's leader is still the
 // leader, gets the commit index, and waits until this node has applied it.
 func (n *Node) waitReadIndex(ctx context.Context) error {
+	ctx, span := n.cfg.Tracer.Start(ctx, "kv.read_index")
+	defer span.End()
+
 	ctx, cancel := context.WithTimeout(ctx, n.cfg.RequestTimeout)
 	defer cancel()
 
+	start := time.Now()
 	rctx := binary.BigEndian.AppendUint64(binary.BigEndian.AppendUint64(nil, n.cfg.ID), n.readSeq.Add(1))
 	key := string(rctx)
 
@@ -135,6 +167,8 @@ func (n *Node) waitReadIndex(ctx context.Context) error {
 	if err := n.applied.wait(ctx, n.stopc, index); err != nil {
 		return fmt.Errorf("%w: waiting to apply index %d: %w", ErrUnavailable, index, err)
 	}
+
+	n.metrics.observe(func(m *Metrics) prometheus.Histogram { return m.readIndexDuration }, start)
 
 	return nil
 }

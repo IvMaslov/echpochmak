@@ -18,6 +18,7 @@ const (
 	spaceTables     = "tbl/"
 	spaceViews      = "view/"
 	spacePurges     = "purge/"
+	spaceIntents    = "intent/"
 	pingKey         = "ping"
 )
 
@@ -53,6 +54,15 @@ func (k keys) purges() []byte {
 
 func (k keys) purge(id string) []byte {
 	return []byte(k.prefix + spacePurges + id)
+}
+
+// intents returns the prefix of every commit intent.
+func (k keys) intents() []byte {
+	return []byte(k.prefix + spaceIntents)
+}
+
+func (k keys) intent(id string) []byte {
+	return []byte(k.prefix + spaceIntents + id)
 }
 
 func (k keys) ping() []byte {
@@ -96,6 +106,21 @@ type purgeValue struct {
 	Created          time.Time `json:"created"`
 	ClaimOwner       string    `json:"claim_owner,omitempty"`
 	ClaimUntil       time.Time `json:"claim_until,omitzero"`
+}
+
+// intentValue is the JSON value of a commit intent key.
+type intentValue struct {
+	Locations []string     `json:"locations"`
+	Idents    []identValue `json:"idents,omitempty"`
+	Owner     string       `json:"owner,omitempty"`
+	Created   time.Time    `json:"created"`
+	Condemned bool         `json:"condemned,omitempty"`
+}
+
+// identValue is a table or view identifier inside a JSON value.
+type identValue struct {
+	Namespace []string `json:"namespace"`
+	Name      string   `json:"name"`
 }
 
 func encode(v any) ([]byte, error) {

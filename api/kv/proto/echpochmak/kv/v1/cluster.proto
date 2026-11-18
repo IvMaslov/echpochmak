@@ -96,6 +96,8 @@ message StatusResponse {
   uint64 applied_index = 6;
   // Followers, when this node is the leader.
   repeated FollowerProgress followers = 7;
+  // The node's placement label, such as an availability zone.
+  string zone = 8;
 }
 
 // ErrorDetail is attached to error statuses. Clients use it to tell a write

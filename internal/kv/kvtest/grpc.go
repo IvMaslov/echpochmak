@@ -1,6 +1,7 @@
 package kvtest
 
 import (
+	"bytes"
 	"context"
 	"log/slog"
 	"maps"
@@ -16,6 +17,7 @@ import (
 	"echpochmak/internal/kv/daemon"
 	"echpochmak/internal/kv/kvpb"
 	"echpochmak/internal/kv/node"
+	"echpochmak/internal/kv/snapshot"
 )
 
 // GRPCCluster runs full kv-node daemons in one process, on localhost ports,
@@ -64,6 +66,56 @@ func NewGRPCCluster(tb testing.TB, size int) *GRPCCluster {
 	return c
 }
 
+// DataDir is the data directory of every node, on the node's own filesystem.
+const DataDir = "/data"
+
+// NewRestoredGRPCCluster restores a snapshot file onto new nodes with the
+// given IDs and starts them as a new cluster, as an operator would with
+// kvctl snapshot restore. bump is the revision bump; zero for the default.
+func NewRestoredGRPCCluster(tb testing.TB, ids []uint64, file []byte, bump int64) *GRPCCluster {
+	tb.Helper()
+
+	c := &GRPCCluster{tb: tb, nodes: map[uint64]*grpcNode{}}
+
+	for _, id := range ids {
+		n := c.reserve(id)
+		c.members = append(c.members, &kvpb.Member{Id: id, PeerUrl: "http://" + n.peerAddr})
+	}
+
+	for _, id := range ids {
+		_, err := snapshot.Restore(bytes.NewReader(file), node.RestoreConfig{
+			ID:           id,
+			DataDir:      DataDir,
+			FS:           c.nodes[id].fs,
+			Members:      c.members,
+			RevisionBump: bump,
+		})
+		if err != nil {
+			tb.Fatalf("restoring node %d: %v", id, err)
+		}
+	}
+
+	for _, id := range ids {
+		c.start(id, nil)
+	}
+
+	tb.Cleanup(func() {
+		for _, id := range c.running() {
+			c.Stop(id)
+		}
+	})
+
+	return c
+}
+
+// FS returns the filesystem that holds a node's data directory, [DataDir].
+func (c *GRPCCluster) FS(id uint64) vfs.FS {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return c.nodes[id].fs
+}
+
 func (c *GRPCCluster) listen(addr string) net.Listener {
 	c.tb.Helper()
 
@@ -105,7 +157,7 @@ func (c *GRPCCluster) start(id uint64, join []string) {
 	cfg := daemon.Config{
 		Node: node.Config{
 			ID:             id,
-			DataDir:        "/data",
+			DataDir:        DataDir,
 			FS:             n.fs,
 			TickInterval:   10 * time.Millisecond,
 			RequestTimeout: 2 * time.Second,

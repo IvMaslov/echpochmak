@@ -154,6 +154,22 @@ func (sm *StateMachine) ImportSnapshot(b *pebble.Batch, r io.Reader) (*kvpb.Appl
 	return state, nil
 }
 
+// WriteApplied adds to b a replacement of the applied state, for a restore
+// that rewrites the members, the conf state and the revision of an imported
+// snapshot. The caller commits b, then calls [StateMachine.SetApplied].
+func WriteApplied(b *pebble.Batch, state *kvpb.AppliedState) error {
+	raw, err := proto.Marshal(state)
+	if err != nil {
+		return fmt.Errorf("encoding applied state: %w", err)
+	}
+
+	if err := b.Set([]byte(keyApplied), raw, nil); err != nil {
+		return fmt.Errorf("writing applied state: %w", err)
+	}
+
+	return nil
+}
+
 func writeRecord(w *bufio.Writer, key, value []byte) error {
 	for _, part := range [][]byte{key, value} {
 		var lenBuf [binary.MaxVarintLen64]byte

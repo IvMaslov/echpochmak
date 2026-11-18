@@ -15,6 +15,9 @@ import (
 	"echpochmak/internal/kv/kvpb"
 )
 
+// keyRevision names the revision in command output.
+const keyRevision = "revision"
+
 type command struct {
 	ctx  context.Context //nolint:containedctx // one command, one context.
 	c    *client.Client
@@ -38,6 +41,8 @@ func (cmd *command) dispatch(args []string) error {
 		return cmd.leader(rest)
 	case "status":
 		return cmd.status()
+	case "snapshot":
+		return cmd.snapshot(rest)
 	default:
 		return fmt.Errorf("unknown command %q", name)
 	}
@@ -131,7 +136,7 @@ func (cmd *command) put(args []string) error {
 		return err
 	}
 
-	return cmd.printResult(map[string]any{"revision": resp.GetHeader().GetRevision()})
+	return cmd.printResult(map[string]any{keyRevision: resp.GetHeader().GetRevision()})
 }
 
 func (cmd *command) del(args []string) error {
@@ -154,7 +159,7 @@ func (cmd *command) del(args []string) error {
 		return err
 	}
 
-	return cmd.printResult(map[string]any{"deleted": resp.GetDeleted(), "revision": resp.GetHeader().GetRevision()})
+	return cmd.printResult(map[string]any{"deleted": resp.GetDeleted(), keyRevision: resp.GetHeader().GetRevision()})
 }
 
 type memberRow struct {
@@ -247,6 +252,7 @@ type statusRow struct {
 	Endpoint string `json:"endpoint"`
 	ID       uint64 `json:"id,omitempty"`
 	Leader   uint64 `json:"leader,omitempty"`
+	Zone     string `json:"zone,omitempty"`
 	State    string `json:"state,omitempty"`
 	Term     uint64 `json:"term,omitempty"`
 	Commit   uint64 `json:"commit,omitempty"`
@@ -270,6 +276,7 @@ func (cmd *command) status() error {
 			Endpoint: ep,
 			ID:       st.GetHeader().GetMemberId(),
 			Leader:   st.GetLeaderId(),
+			Zone:     st.GetZone(),
 			State:    st.GetRaftState(),
 			Term:     st.GetHeader().GetRaftTerm(),
 			Commit:   st.GetCommitIndex(),
@@ -277,13 +284,51 @@ func (cmd *command) status() error {
 		})
 	}
 
-	header := []string{"ENDPOINT", "ID", "LEADER", "STATE", "TERM", "COMMIT", "APPLIED", "ERROR"}
+	header := []string{"ENDPOINT", "ID", "LEADER", "ZONE", "STATE", "TERM", "COMMIT", "APPLIED", "ERROR"}
 
-	return printTable(cmd, rows, header, func(r statusRow) []string {
+	err := printTable(cmd, rows, header, func(r statusRow) []string {
 		u := func(v uint64) string { return strconv.FormatUint(v, 10) }
 
-		return []string{r.Endpoint, u(r.ID), u(r.Leader), r.State, u(r.Term), u(r.Commit), u(r.Applied), r.Error}
+		return []string{
+			r.Endpoint, u(r.ID), u(r.Leader), r.Zone, r.State, u(r.Term), u(r.Commit), u(r.Applied), r.Error,
+		}
 	})
+	if err != nil {
+		return err
+	}
+
+	if warning := placementWarning(rows); warning != "" && !cmd.json {
+		fmt.Fprintln(cmd.out, "warning:", warning)
+	}
+
+	return nil
+}
+
+// placementWarning reports a zone that holds a majority of the nodes listed:
+// losing that zone loses the quorum. It only judges nodes that answered and
+// carry a zone label, and the endpoints should list every voter.
+func placementWarning(rows []statusRow) string {
+	perZone := map[string]int{}
+	labelled := 0
+
+	for _, r := range rows {
+		if r.Error == "" && r.Zone != "" {
+			perZone[r.Zone]++
+			labelled++
+		}
+	}
+
+	if labelled < 2 {
+		return ""
+	}
+
+	for _, zone := range slices.Sorted(maps.Keys(perZone)) {
+		if n := perZone[zone]; n > labelled/2 {
+			return fmt.Sprintf("zone %q holds %d of %d nodes: losing it loses the quorum", zone, n, labelled)
+		}
+	}
+
+	return ""
 }
 
 func parseID(s string) (uint64, error) {

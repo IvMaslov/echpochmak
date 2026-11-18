@@ -41,6 +41,7 @@ func Run(t *testing.T, newStore Factory) {
 	t.Run("GetTables", func(t *testing.T) { testGetTables(t, newStore) })
 	t.Run("DropTable", func(t *testing.T) { testDropTable(t, newStore) })
 	t.Run("PurgeQueue", func(t *testing.T) { testPurgeQueue(t, newStore) })
+	t.Run("Intents", func(t *testing.T) { testIntents(t, newStore) })
 }
 
 func testNamespaces(t *testing.T, newStore Factory) {

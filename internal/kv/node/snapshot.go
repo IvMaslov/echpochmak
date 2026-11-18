@@ -12,6 +12,7 @@ import (
 	"go.etcd.io/raft/v3/raftpb"
 	"google.golang.org/protobuf/proto"
 
+	"echpochmak/internal/kv/kvpb"
 	"echpochmak/internal/kv/statemachine"
 )
 
@@ -29,6 +30,12 @@ type OutgoingSnapshot struct {
 // Metadata returns the index, term and configuration of the snapshot.
 func (s *OutgoingSnapshot) Metadata() *raftpb.SnapshotMetadata {
 	return proto.CloneOf(s.meta)
+}
+
+// State returns the applied state the snapshot holds: index, term,
+// revision, members.
+func (s *OutgoingSnapshot) State() *kvpb.AppliedState {
+	return s.export.State()
 }
 
 // WriteTo streams the snapshot data.
@@ -64,6 +71,17 @@ func (n *Node) OpenSnapshot() (*OutgoingSnapshot, error) {
 	}
 
 	return &OutgoingSnapshot{export: export, meta: meta}, nil
+}
+
+// OpenLinearizableSnapshot is [Node.OpenSnapshot] after a ReadIndex
+// barrier: the snapshot contains every write acknowledged anywhere in the
+// cluster before the call. Backups use it.
+func (n *Node) OpenLinearizableSnapshot(ctx context.Context) (*OutgoingSnapshot, error) {
+	if err := n.waitReadIndex(ctx); err != nil {
+		return nil, err
+	}
+
+	return n.OpenSnapshot()
 }
 
 // ReceiveSnapshot stages the data of a snapshot sent by the leader, then

@@ -1,0 +1,112 @@
+# Zone stack, layered on docker-compose.yaml and docker-compose.ha.yaml:
+#
+#   make obs-up      start it with the observability overlay
+#   make dr-e2e      run the disaster drills on it, then remove it
+#
+# Five kv-nodes in three zones (kv1, kv2 in a; kv3, kv4 in b; kv5 in c), so
+# losing any one zone keeps the quorum (arch/phase5/plan.md, D4 and D11),
+# and kv-backup, which backs the cluster up to the backup bucket every 30 s.
+# Docker has no zones: a zone is lost by killing its containers.
+
+x-five-nodes: &five-nodes 1=http://kv1:2380,2=http://kv2:2380,3=http://kv3:2380,4=http://kv4:2380,5=http://kv5:2380
+x-endpoints: &endpoints kv1:2379,kv2:2379,kv3:2379,kv4:2379,kv5:2379
+
+services:
+  kv1:
+    environment:
+      ECHPOCHMAK_KV_INITIAL_CLUSTER: *five-nodes
+      ECHPOCHMAK_KV_ZONE: a
+
+  kv2:
+    environment:
+      ECHPOCHMAK_KV_INITIAL_CLUSTER: *five-nodes
+      ECHPOCHMAK_KV_ZONE: a
+
+  kv3:
+    environment:
+      ECHPOCHMAK_KV_INITIAL_CLUSTER: *five-nodes
+      ECHPOCHMAK_KV_ZONE: b
+
+  kv4: &extra-node
+    profiles: ["kv"]
+    build: &kv-build
+      context: ../..
+      dockerfile: build/kv-node/Dockerfile
+      network: ${BUILD_NETWORK:-default}
+    image: echpochmak/kv-node:dev
+    environment:
+      ECHPOCHMAK_KV_ID: "4"
+      ECHPOCHMAK_KV_DATA_DIR: /data
+      ECHPOCHMAK_KV_INITIAL_CLUSTER: *five-nodes
+      ECHPOCHMAK_KV_LOG_FORMAT: text
+      ECHPOCHMAK_KV_ZONE: b
+    ports:
+      - "23794:2379"
+    volumes:
+      - kv4-data:/data
+
+  kv5:
+    <<: *extra-node
+    environment:
+      ECHPOCHMAK_KV_ID: "5"
+      ECHPOCHMAK_KV_DATA_DIR: /data
+      ECHPOCHMAK_KV_INITIAL_CLUSTER: *five-nodes
+      ECHPOCHMAK_KV_LOG_FORMAT: text
+      ECHPOCHMAK_KV_ZONE: c
+    ports:
+      - "23795:2379"
+    volumes:
+      - kv5-data:/data
+
+  catalog-a: &zone-catalog
+    depends_on:
+      kv4:
+        condition: service_started
+      kv5:
+        condition: service_started
+    environment:
+      ECHPOCHMAK_KV_ENDPOINTS: *endpoints
+      # Short janitor timings, so the drills see orphans cleaned within
+      # seconds. ORPHAN_CLEANUP=false starts the catalogs as the runbook does
+      # after a restore.
+      ECHPOCHMAK_ORPHAN_CLEANUP: ${ORPHAN_CLEANUP:-true}
+      ECHPOCHMAK_ORPHAN_GRACE: 20s
+      ECHPOCHMAK_ORPHAN_INTERVAL: 5s
+
+  catalog-b:
+    <<: *zone-catalog
+
+  kv-backup:
+    profiles: ["kv"]
+    build: *kv-build
+    image: echpochmak/kv-node:dev
+    entrypoint: ["/kv-backup"]
+    command: ["run"]
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+      kv1:
+        condition: service_started
+      kv5:
+        condition: service_started
+    environment:
+      ECHPOCHMAK_BACKUP_ENDPOINTS: *endpoints
+      ECHPOCHMAK_BACKUP_LOCATION: s3://${MINIO_BACKUP_BUCKET:-echpochmak-backups}/kv
+      ECHPOCHMAK_BACKUP_INTERVAL: 30s
+      ECHPOCHMAK_BACKUP_VERIFY_INTERVAL: 2m
+      ECHPOCHMAK_BACKUP_KEEP_LAST: "20"
+      ECHPOCHMAK_BACKUP_LOG_FORMAT: text
+      ECHPOCHMAK_BACKUP_S3_ENDPOINT: http://minio:9000
+      ECHPOCHMAK_BACKUP_S3_REGION: ${S3_REGION}
+      ECHPOCHMAK_BACKUP_S3_PATH_STYLE: "true"
+      ECHPOCHMAK_BACKUP_S3_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      ECHPOCHMAK_BACKUP_S3_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+    healthcheck:
+      test: ["CMD", "/kv-backup", "probe"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  kv4-data:
+  kv5-data:

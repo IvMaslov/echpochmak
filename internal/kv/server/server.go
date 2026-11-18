@@ -1,5 +1,6 @@
 // Package server serves the client API of a KV node over gRPC: the KV
-// service, the cluster service and the standard health service.
+// service, the cluster service, the maintenance service and the standard
+// health service.
 package server
 
 import (
@@ -26,6 +27,8 @@ type Options struct {
 	// ReadyMaxLag is how far the applied index may trail the commit index
 	// for the node to report itself healthy.
 	ReadyMaxLag uint64
+	// Zone is the node's placement label, reported by Status.
+	Zone string
 }
 
 // Register adds the KV, cluster and health services of n to s. The health
@@ -36,7 +39,8 @@ func Register(ctx context.Context, s *grpc.Server, n *node.Node, opts Options) {
 	}
 
 	kvpb.RegisterKVServiceServer(s, &kvService{n: n})
-	kvpb.RegisterClusterServiceServer(s, &clusterService{n: n})
+	kvpb.RegisterClusterServiceServer(s, &clusterService{n: n, zone: opts.Zone})
+	kvpb.RegisterMaintenanceServiceServer(s, &maintenanceService{n: n})
 
 	hs := health.NewServer()
 	healthpb.RegisterHealthServer(s, hs)
@@ -51,11 +55,8 @@ func watchHealth(ctx context.Context, n *node.Node, hs *health.Server, maxLag ui
 	defer t.Stop()
 
 	for {
-		st := n.Status()
-		ready := st.Leader != 0 && st.Applied+maxLag >= st.Commit
-
 		status := healthpb.HealthCheckResponse_NOT_SERVING
-		if ready {
+		if Ready(n, maxLag) {
 			status = healthpb.HealthCheckResponse_SERVING
 		}
 

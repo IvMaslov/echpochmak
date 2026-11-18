@@ -35,6 +35,42 @@ func TestLoadDefaults(t *testing.T) {
 	}
 }
 
+func TestRaftDefaultsNest(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := config.Load([]string{"-store-backend", "raft", "-kv-endpoints", "a:2379"}, env(nil))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	if cfg.HTTP.WriteTimeout != 90*time.Second {
+		t.Fatalf("HTTP.WriteTimeout = %s, want 90s", cfg.HTTP.WriteTimeout)
+	}
+}
+
+func TestOrphanGrace(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := config.Load(nil, env(nil))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	if !cfg.Catalog.OrphanCleanup || cfg.OrphanGrace() != 2*cfg.HTTP.WriteTimeout {
+		t.Fatalf("orphan cleanup %v with grace %s, want on with twice the write timeout",
+			cfg.Catalog.OrphanCleanup, cfg.OrphanGrace())
+	}
+
+	cfg, err = config.Load([]string{"-orphan-grace", "10s", "-orphan-cleanup=false"}, env(nil))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	if cfg.Catalog.OrphanCleanup || cfg.OrphanGrace() != 10*time.Second {
+		t.Fatalf("orphan cleanup %v with grace %s, want off with 10s", cfg.Catalog.OrphanCleanup, cfg.OrphanGrace())
+	}
+}
+
 func TestLoadPrecedence(t *testing.T) {
 	t.Parallel()
 
@@ -90,6 +126,15 @@ func TestLoadErrors(t *testing.T) {
 		{name: "negative cache size", args: []string{"-metadata-cache-size", "-1"}, want: "metadata-cache-size"},
 		{name: "zero body limit", args: []string{"-http-max-body-bytes", "0"}, want: "http-max-body-bytes"},
 		{name: "half credentials", args: []string{"-s3-access-key-id", "key"}, want: "set together"},
+		{
+			// Three store calls per attempt: the Phase 3 default no longer
+			// nests (5 x 3 x 5s = 75s).
+			name: "old write timeout with intents",
+			args: []string{"-store-backend", "raft", "-kv-endpoints", "a:2379", "-http-write-timeout", "60s"},
+			want: "x 3 x kv-request-timeout",
+		},
+		{name: "zero orphan interval", args: []string{"-orphan-interval", "0s"}, want: "orphan-interval"},
+		{name: "negative orphan grace", args: []string{"-orphan-grace", "-1s"}, want: "orphan-grace"},
 	}
 
 	for _, tt := range tests {

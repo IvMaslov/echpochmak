@@ -41,13 +41,19 @@ services:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
       MINIO_BUCKET: ${MINIO_BUCKET}
+      MINIO_BACKUP_BUCKET: ${MINIO_BACKUP_BUCKET:-echpochmak-backups}
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
         set -e
         mc alias set local http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD"
         mc mb --ignore-existing "local/$$MINIO_BUCKET"
-        echo "bucket $$MINIO_BUCKET is ready"
+        # Versioning keeps deleted files recoverable after a restore of the
+        # KV store (docs/operations.md).
+        mc version enable "local/$$MINIO_BUCKET"
+        # KV backups go to their own bucket.
+        mc mb --ignore-existing "local/$$MINIO_BACKUP_BUCKET"
+        echo "buckets $$MINIO_BUCKET and $$MINIO_BACKUP_BUCKET are ready"
     restart: "no"
 
   catalog:
@@ -63,6 +69,7 @@ services:
         condition: service_completed_successfully
     environment:
       ECHPOCHMAK_HTTP_ADDR: ":8181"
+      ECHPOCHMAK_DOCS: "true"
       ECHPOCHMAK_LOG_FORMAT: text
       ECHPOCHMAK_LOG_LEVEL: debug
       ECHPOCHMAK_S3_ENDPOINT: http://minio:9000
@@ -115,8 +122,9 @@ services:
       - ../../test/rck/exclusions.txt:/rck/exclusions.txt:ro
 
   # A 3-node KV cluster, under the "kv" profile: start it with
-  # `docker compose --profile kv up`. The catalog does not use it until
-  # Phase 3. Client ports on the host: 23791-23793.
+  # `docker compose --profile kv up`; the HA overlay connects the catalogs
+  # to it. Client ports on the host: 23791-23793. Each node also serves
+  # /metrics, /healthz and /readyz on 2381, inside the network.
   kv1: &kv-node
     profiles: ["kv"]
     build:

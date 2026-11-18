@@ -1,0 +1,18 @@
+# Prometheus for the observability overlay (docker-compose.obs.yaml).
+# Targets are listed statically: the stack's services have fixed names.
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: catalog
+    static_configs:
+      - targets: ["catalog-a:8181", "catalog-b:8181"]
+
+  - job_name: kv
+    static_configs:
+      - targets: ["kv1:2381", "kv2:2381", "kv3:2381", "kv4:2381", "kv5:2381"]
+
+  - job_name: kv-backup
+    static_configs:
+      - targets: ["kv-backup:2382"]

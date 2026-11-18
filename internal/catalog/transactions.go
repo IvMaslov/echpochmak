@@ -33,7 +33,7 @@ func (s *Service) CommitTransaction(ctx context.Context, changes []CommitInput) 
 	start := time.Now()
 	entity := slog.Int("tables", len(changes))
 
-	written, attempts, err := retryOnRace(ctx, s, entity, func() (int, error) {
+	written, attempts, err := retryOnRace(ctx, s, kindTransaction, entity, func(ctx context.Context) (int, error) {
 		return s.commitTransactionOnce(ctx, changes)
 	})
 	if err != nil {
@@ -86,21 +86,31 @@ func (s *Service) commitTransactionOnce(ctx context.Context, changes []CommitInp
 	}
 
 	locations := make([]string, 0, len(plans))
-	commits := make([]store.Commit, 0, len(plans))
+	ids := make([]store.Ident, 0, len(plans))
 
 	for _, p := range plans {
 		locations = append(locations, p.location)
-		commits = append(commits, p.commit())
+		ids = append(ids, p.ident)
+	}
+
+	intent, err := s.beginWrite(ctx, ids, locations)
+	if err != nil {
+		return 0, err
 	}
 
 	if err := s.writeAll(ctx, plans); err != nil {
-		s.deleteFiles(ctx, locations, "transaction failed before its commit")
+		s.abandonWrite(ctx, intent, locations, "transaction failed before its commit")
 
 		return 0, err
 	}
 
+	commits := make([]store.Commit, 0, len(plans))
+	for _, p := range plans {
+		commits = append(commits, p.commit(intent))
+	}
+
 	if _, err := s.store.CommitTables(ctx, commits); err != nil {
-		return 0, s.handleFailedPointerWrite(ctx, err, locations...)
+		return 0, s.handleFailedPointerWrite(ctx, err, intent, locations)
 	}
 
 	for _, p := range plans {

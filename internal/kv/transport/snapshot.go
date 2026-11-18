@@ -34,6 +34,7 @@ func (t *Transport) sendSnapshot(h Handler, p *peer, msg *raftpb.Message) {
 	err := t.streamSnapshot(h, p, msg)
 
 	h.ReportSnapshot(p.id, err == nil)
+	t.cfg.Metrics.snapshotSent(err)
 
 	if err != nil {
 		t.log.Warn("sending snapshot failed", slog.Uint64("peer", p.id), slog.Any("error", err))

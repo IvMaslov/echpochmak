@@ -123,11 +123,12 @@ Phases 1 and 2 are independent and can run in parallel.
 - Swagger UI for rest api. For easy manual testing.
 - Not served, by decision: OAuth tokens, credential vending, S3 request signing, server-side scan planning, functions.
 
-### Phase 5: Disaster resistance and operations
-- Periodic raft snapshots exported to S3, plus a tool that rebuilds a cluster from a snapshot.
-- Spread the cluster across availability zones (odd node count). Document the RPO/RTO you're targeting.
-- Prometheus metrics (commit latency, conflicts, raft term/leader changes, apply lag, WAL fsync time) and OpenTelemetry tracing.
-- Orphan-metadata cleanup for files written by commits that later failed CAS.
+### Phase 5: Disaster resistance and operations (done, 2026-11-15)
+- Periodic raft snapshots exported to S3 (`kv-backup`: schedule, retention, daily test restore), plus `kvctl snapshot restore`, which rebuilds a cluster from a snapshot with a new cluster ID. `catalogctl restore-report` rolls tables forward to the commits made after the backup.
+- Spread the cluster across availability zones (odd node count). The RPO/RTO targets are in `arch/phase5/plan.md` (D4) and `docs/operations.md`; ADR-006 has the measured values.
+- Prometheus metrics (commit latency, conflicts, raft term/leader changes, apply lag, WAL fsync time) and OpenTelemetry tracing, with a Grafana dashboard. Alerting was dropped by decision: the dashboard shows what the alerts would have watched.
+- Orphan-metadata cleanup for files written by commits that later failed CAS: commit intents in the KV store, released by the commit itself, and a janitor on every replica.
+- Moved out: TLS between nodes, catalogs and clients (decision 3; it goes with authentication in a later security phase). Kubernetes manifests, untestable here, are described as placement rules in the operator's guide.
 
 ## Testing strategy
 

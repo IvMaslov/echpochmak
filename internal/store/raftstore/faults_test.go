@@ -44,7 +44,7 @@ func create(t *testing.T, s store.Store, name string) store.Pointer {
 }
 
 // One transaction holds up to raftstore.TxnBudget compares: an update costs
-// one, a create three.
+// one, a create three, an intent one.
 func TestTransactionSizeLimit(t *testing.T) {
 	t.Parallel()
 
@@ -108,6 +108,46 @@ func TestTransactionSizeLimit(t *testing.T) {
 	over := append(slices.Clone(updates), extra)
 	if _, err := s.CommitTables(t.Context(), over); !errors.Is(err, store.ErrInvalidArgument) {
 		t.Fatalf("%d updates: error %v, want ErrInvalidArgument", len(over), err)
+	}
+
+	testIntentBudget(t, s, ids[:raftstore.TxnBudget])
+}
+
+// testIntentBudget checks that an intent costs one compare: with it, one
+// update less fits in a transaction.
+func testIntentBudget(t *testing.T, s *raftstore.Store, ids []store.Ident) {
+	t.Helper()
+
+	withIntent := func(n int) []store.Commit {
+		ptrs, err := s.GetTables(t.Context(), ids[:n])
+		if err != nil {
+			t.Fatalf("reading %d tables: %v", n, err)
+		}
+
+		intent, err := s.CreateIntent(t.Context(), store.Intent{Locations: []string{"s3://w/m3"}})
+		if err != nil {
+			t.Fatalf("CreateIntent: %v", err)
+		}
+
+		out := make([]store.Commit, 0, n)
+		for _, p := range ptrs {
+			out = append(out, store.Commit{
+				Ident:            p.Ident,
+				ExpectedVersion:  p.Version,
+				MetadataLocation: "s3://w/m3",
+				Intent:           intent.Ref(),
+			})
+		}
+
+		return out
+	}
+
+	if _, err := s.CommitTables(t.Context(), withIntent(len(ids))); !errors.Is(err, store.ErrInvalidArgument) {
+		t.Fatalf("%d updates and an intent: error %v, want ErrInvalidArgument", len(ids), err)
+	}
+
+	if _, err := s.CommitTables(t.Context(), withIntent(len(ids)-1)); err != nil {
+		t.Fatalf("%d updates and an intent: %v", len(ids)-1, err)
 	}
 }
 
@@ -259,7 +299,13 @@ func TestLeaderLossDuringCommits(t *testing.T) {
 		switch {
 		case err == nil:
 			current = ps[0]
-		case errors.Is(err, store.ErrUnavailable):
+		case store.IsDefinitelyNotApplied(err):
+			// A definite failure: the pointer must not have moved.
+			got, getErr := s.GetTable(t.Context(), current.Ident)
+			if getErr != nil || got.Version != current.Version {
+				t.Fatalf("pointer after a definite failure = %+v, %v; want %+v", got, getErr, current)
+			}
+		case errors.Is(err, store.ErrOutcomeUnknown):
 			// The outcome is unknown: the pointer moved to next, or did not.
 			unknown++
 

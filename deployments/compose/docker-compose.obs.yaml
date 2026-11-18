@@ -1,0 +1,71 @@
+# Observability overlay, layered on docker-compose.yaml, docker-compose.ha.yaml
+# and docker-compose.zones.yaml:
+#
+#   make obs-up     start the whole stack     make obs-down    remove it
+#
+#   Prometheus  http://localhost:9090
+#   Grafana     http://localhost:3000   (anonymous admin, local use only)
+#   Jaeger      http://localhost:16686
+#
+# Every component exports traces to Jaeger over OTLP; Prometheus scrapes the
+# catalogs, the kv-nodes and kv-backup (prometheus/prometheus.yml). The
+# images are pinned by digest; see arch/phase5/plan.md (D10).
+
+x-tracing: &tracing
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+  OTEL_EXPORTER_OTLP_INSECURE: "true"
+
+services:
+  catalog-a:
+    environment:
+      <<: *tracing
+      OTEL_RESOURCE_ATTRIBUTES: service.instance.id=catalog-a
+
+  catalog-b:
+    environment:
+      <<: *tracing
+      OTEL_RESOURCE_ATTRIBUTES: service.instance.id=catalog-b
+
+  kv1: &traced-node
+    environment:
+      <<: *tracing
+
+  kv2: *traced-node
+  kv3: *traced-node
+  kv4: *traced-node
+  kv5: *traced-node
+
+  prometheus:
+    profiles: ["kv"]
+    image: prom/prometheus:v3.16.0@sha256:e04987641b57704f408e31f6373ba4138ecf27cb4a165d24aabb6c38fddd0f06
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=2d
+      - --web.enable-lifecycle
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+
+  jaeger:
+    profiles: ["kv"]
+    image: jaegertracing/jaeger:2.23.0@sha256:3823829974ccfc2485d2e48b165579091f32295022ae80ca49704e2f4834116e
+    ports:
+      - "16686:16686" # UI and query API
+
+  grafana:
+    profiles: ["kv"]
+    image: grafana/grafana:13.3.1@sha256:0615ec4fbd4072004b7d86b46ded63013a74b7d6eb1119273dd89e8fa25c13cf
+    depends_on:
+      - prometheus
+      - jaeger
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/overview.json
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3000:3000"

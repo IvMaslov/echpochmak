@@ -16,6 +16,11 @@
 //	member remove ID                    remove a node
 //	leader transfer [ID]                hand leadership to ID, or the best follower
 //	status                              show the status of every endpoint
+//	snapshot save FILE [-endpoint EP]   save a consistent snapshot, from a follower by default
+//	snapshot save FILE -data-dir DIR    save a stopped node's state offline (unsafe recovery)
+//	snapshot status FILE                verify a snapshot file and show its header
+//	snapshot restore FILE -id ID -data-dir DIR -initial-cluster id=url,... [-revision-bump N]
+//	                                    create one node of a new cluster from a snapshot
 //
 // The endpoints default to $ECHPOCHMAK_KV_ENDPOINTS, then localhost:2379.
 package main

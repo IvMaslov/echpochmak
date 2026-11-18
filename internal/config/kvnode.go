@@ -12,6 +12,7 @@ import (
 
 	"echpochmak/internal/kv/kvpb"
 	"echpochmak/internal/kv/node"
+	"echpochmak/internal/kv/server"
 	"echpochmak/internal/kv/statemachine"
 	"echpochmak/internal/logger"
 )
@@ -30,6 +31,15 @@ type KVNode struct {
 	// "kvctl member add".
 	ListenPeer   string
 	ListenClient string
+	// ListenMetrics is the address of the HTTP listener for /metrics,
+	// /healthz and /readyz; empty turns it off.
+	ListenMetrics string
+	// Zone labels the node's placement, such as an availability zone. It is
+	// reported, not replicated.
+	Zone string
+	// ReadyMaxLag is how many entries the applied index may trail the
+	// commit index for the node to report itself ready.
+	ReadyMaxLag uint64
 
 	// InitialCluster bootstraps a new cluster: "id=peer-url,...".
 	InitialCluster string
@@ -92,6 +102,11 @@ func registerKVNode(fs *flag.FlagSet, cfg *KVNode) {
 	fs.StringVar(&cfg.DataDir, "data-dir", "", "directory of the node's database")
 	fs.StringVar(&cfg.ListenPeer, "listen-peer", ":2380", "listen address of the peer service")
 	fs.StringVar(&cfg.ListenClient, "listen-client", ":2379", "listen address of the client API")
+	fs.StringVar(&cfg.ListenMetrics, "listen-metrics", ":2381",
+		"listen address of /metrics, /healthz and /readyz; empty turns it off")
+	fs.StringVar(&cfg.Zone, "zone", "", "placement label of the node, such as its availability zone")
+	fs.Uint64Var(&cfg.ReadyMaxLag, "ready-max-lag", server.DefaultReadyMaxLag,
+		"entries the applied index may trail the commit index for the node to be ready")
 	fs.StringVar(&cfg.InitialCluster, "initial-cluster", "",
 		"bootstrap a new cluster with these voters: id=peer-url,... (ignored when data-dir has state)")
 	fs.Func("join", "join the cluster at these client endpoints, comma-separated (ignored when data-dir has state)",
@@ -217,6 +232,8 @@ func (c KVNode) LogValue() slog.Value {
 		slog.String("data_dir", c.DataDir),
 		slog.String("listen_peer", c.ListenPeer),
 		slog.String("listen_client", c.ListenClient),
+		slog.String("listen_metrics", c.ListenMetrics),
+		slog.String("zone", c.Zone),
 		slog.String("initial_cluster", c.InitialCluster),
 		slog.Any("join", c.Join),
 		slog.Duration("tick_interval", c.TickInterval),

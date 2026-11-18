@@ -130,6 +130,7 @@ func serveIdempotent(
 
 	decision, rec, ticket, err := g.Begin(ctx, key, fingerprint(r, body))
 	if err != nil {
+		setIdempotency(r, idemUnavailable)
 		logger.FromContext(ctx).WarnContext(ctx, "idempotency store unavailable", logger.Err(err))
 		writeErrorModel(w, r, http.StatusServiceUnavailable, typeServiceUnavailable,
 			"the idempotency store is unavailable; retry later")
@@ -139,15 +140,19 @@ func serveIdempotent(
 
 	switch decision {
 	case idempotency.Replay:
+		setIdempotency(r, idemReplayed)
 		replay(next, load, w, r, rec.Response)
 	case idempotency.Mismatch:
+		setIdempotency(r, idemMismatch)
 		writeErrorModel(w, r, http.StatusUnprocessableEntity, typeUnprocessable,
 			"Idempotency-Key was already used for a different request")
 	case idempotency.Busy:
+		setIdempotency(r, idemBusy)
 		w.Header().Set("Retry-After", "1")
 		writeErrorModel(w, r, http.StatusServiceUnavailable, typeServiceUnavailable,
 			"a request with this Idempotency-Key is in progress; retry later")
 	case idempotency.Execute:
+		setIdempotency(r, idemFirst)
 		rec := &captureWriter{ResponseWriter: w, status: http.StatusOK}
 		next.ServeHTTP(rec, r)
 		g.Finish(ctx, ticket, rec.response(r, pattern, body))

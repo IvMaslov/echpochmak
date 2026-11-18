@@ -10,7 +10,10 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"slices"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/keepalive"
@@ -43,6 +46,12 @@ type Config struct {
 	JoinEndpoints []string
 	Server        server.Options
 	Logger        *slog.Logger
+	// Registry, if set, receives the node's, the transport's and the client
+	// API's metrics.
+	Registry *prometheus.Registry
+	// ClientServerOptions are extra options of the client API's gRPC server,
+	// such as a tracing stats handler.
+	ClientServerOptions []grpc.ServerOption
 }
 
 // Daemon is a running node with its servers.
@@ -66,7 +75,17 @@ func Start(ctx context.Context, cfg Config) (*Daemon, error) {
 		return nil, err
 	}
 
-	tr := transport.New(transport.Config{Logger: cfg.Logger})
+	var grpcMetrics *server.GRPCMetrics
+
+	trCfg := transport.Config{Logger: cfg.Logger}
+
+	if cfg.Registry != nil {
+		cfg.Node.Metrics = node.NewMetrics(cfg.Registry)
+		trCfg.Metrics = transport.NewMetrics(cfg.Registry)
+		grpcMetrics = server.NewGRPCMetrics(cfg.Registry)
+	}
+
+	tr := transport.New(trCfg)
 	cfg.Node.Transport = tr
 	cfg.Node.Logger = cfg.Logger
 
@@ -78,6 +97,10 @@ func Start(ctx context.Context, cfg Config) (*Daemon, error) {
 	}
 
 	tr.SetHandler(n)
+
+	if cfg.Registry != nil {
+		cfg.Registry.MustRegister(node.NewCollector(n, cfg.Server.Zone), tr.Collector())
+	}
 
 	opts := []grpc.ServerOption{
 		grpc.MaxRecvMsgSize(maxMessageBytes),
@@ -94,7 +117,7 @@ func Start(ctx context.Context, cfg Config) (*Daemon, error) {
 		node:      n,
 		transport: tr,
 		peer:      grpc.NewServer(opts...),
-		client:    grpc.NewServer(opts...),
+		client:    grpc.NewServer(clientServerOptions(opts, cfg, grpcMetrics)...),
 		cancel:    cancel,
 		serveErr:  make(chan error, 2),
 		log:       cfg.Logger,
@@ -114,6 +137,21 @@ func Start(ctx context.Context, cfg Config) (*Daemon, error) {
 	)
 
 	return d, nil
+}
+
+// clientServerOptions returns the options of the client API's server: the
+// common ones, the metrics interceptors and the configured extras.
+func clientServerOptions(common []grpc.ServerOption, cfg Config, m *server.GRPCMetrics) []grpc.ServerOption {
+	opts := slices.Clone(common)
+
+	if m != nil {
+		opts = append(opts,
+			grpc.ChainUnaryInterceptor(m.UnaryInterceptor()),
+			grpc.ChainStreamInterceptor(m.StreamInterceptor()),
+		)
+	}
+
+	return append(opts, cfg.ClientServerOptions...)
 }
 
 // resolveJoin fills in the cluster ID and members of the cluster to join.

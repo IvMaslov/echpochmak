@@ -14,8 +14,9 @@ import (
 // location and the cache never needs invalidation; Write and Delete only keep
 // it from serving files the catalog itself has replaced or removed.
 type Cached struct {
-	next FileIO
-	size int
+	next     FileIO
+	size     int
+	onLookup func(hit bool)
 
 	mu    sync.Mutex
 	order *list.List // front is most recently used; values are *cacheEntry
@@ -29,26 +30,46 @@ type cacheEntry struct {
 
 var _ FileIO = (*Cached)(nil)
 
+// CacheOption configures [NewCached].
+type CacheOption func(*Cached)
+
+// WithLookupObserver calls fn on every read with whether the cache had the
+// file; metrics use it.
+func WithLookupObserver(fn func(hit bool)) CacheOption {
+	return func(c *Cached) { c.onLookup = fn }
+}
+
 // NewCached returns next with an LRU cache of up to size files in front of
 // its reads. A size of zero or less disables caching and returns next.
-func NewCached(next FileIO, size int) FileIO {
+func NewCached(next FileIO, size int, opts ...CacheOption) FileIO {
 	if size <= 0 {
 		return next
 	}
 
-	return &Cached{
-		next:  next,
-		size:  size,
-		order: list.New(),
-		items: make(map[string]*list.Element, size),
+	c := &Cached{
+		next:     next,
+		size:     size,
+		order:    list.New(),
+		items:    make(map[string]*list.Element, size),
+		onLookup: func(bool) {},
 	}
+
+	for _, opt := range opts {
+		opt(c)
+	}
+
+	return c
 }
 
 // Read implements [FileIO]. Callers must not modify the returned slice.
 func (c *Cached) Read(ctx context.Context, location string) ([]byte, error) {
 	if data, ok := c.get(location); ok {
+		c.onLookup(true)
+
 		return data, nil
 	}
+
+	c.onLookup(false)
 
 	data, err := c.next.Read(ctx, location)
 	if err != nil {

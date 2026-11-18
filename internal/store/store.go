@@ -14,6 +14,8 @@
 //   - A durable purge queue: a table dropped with [DropOptions.Purge] leaves a
 //     [PurgeTask], written atomically with the drop, until a worker completes
 //     it.
+//   - Commit intents: an intent named by a commit is removed atomically with
+//     the pointer swap, and a condemned intent makes such commits fail.
 //   - Monotonic versions: every write gets a version strictly greater than any
 //     version issued before, so a version is never reused, even after an entry
 //     is dropped and recreated.
@@ -94,4 +96,19 @@ type Store interface {
 	// CompletePurgeTask removes a task, if it is still at the version of
 	// task, or returns [ErrPurgeTaskChanged].
 	CompletePurgeTask(ctx context.Context, task PurgeTask) error
+
+	// CreateIntent records an [Intent] before its files are written. The
+	// store assigns the ID, the creation time and the version.
+	CreateIntent(ctx context.Context, intent Intent) (Intent, error)
+	// ListIntents returns up to limit intents, condemned or not, oldest
+	// first.
+	ListIntents(ctx context.Context, limit int) ([]Intent, error)
+	// CondemnIntent marks an intent condemned, if it is still at the version
+	// of ref, and returns it at its new version. From then on no commit
+	// naming the intent can succeed. It returns [ErrIntentChanged] if the
+	// intent moved or is gone.
+	CondemnIntent(ctx context.Context, ref IntentRef) (Intent, error)
+	// ReleaseIntent removes an intent, if it is still at the version of ref,
+	// or returns [ErrIntentChanged].
+	ReleaseIntent(ctx context.Context, ref IntentRef) error
 }

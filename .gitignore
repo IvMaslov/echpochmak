@@ -8,6 +8,7 @@ arch/prompt.md
 coverage.out
 coverage.html
 /build/rck-reports/
+/build/dr-logs.txt
 
 # Local environment
 deployments/compose/.env

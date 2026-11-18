@@ -11,6 +11,9 @@ import (
 
 	"github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/table"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 
 	"echpochmak/internal/logger"
 	"echpochmak/internal/store"
@@ -53,7 +56,7 @@ func (s *Service) CommitTable(ctx context.Context, in CommitInput) (Table, error
 	start := time.Now()
 	entity := slog.String(logger.KeyTable, in.Ident.String())
 
-	t, attempts, err := retryOnRace(ctx, s, entity, func() (Table, error) {
+	t, attempts, err := retryOnRace(ctx, s, kindTable, entity, func(ctx context.Context) (Table, error) {
 		return s.commitOnce(ctx, in)
 	})
 	if err != nil {
@@ -74,11 +77,34 @@ func (s *Service) CommitTable(ctx context.Context, in CommitInput) (Table, error
 // retryOnRace runs once until it succeeds, fails with an error other than
 // errRetry, or has been retried the configured number of times. It returns
 // the number of attempts made. entity names what is committed, for logs.
-func retryOnRace[T any](ctx context.Context, s *Service, entity slog.Attr, once func() (T, error)) (T, int, error) {
+func retryOnRace[T any](
+	ctx context.Context,
+	s *Service,
+	kind string,
+	entity slog.Attr,
+	once func(ctx context.Context) (T, error),
+) (v T, attempts int, err error) {
+	start := time.Now()
+
+	ctx, span := s.tracer.Start(ctx, "catalog.commit."+kind,
+		trace.WithAttributes(attribute.String("catalog."+entity.Key, entity.Value.String())))
+
+	defer func() {
+		outcome := commitOutcome(err)
+		s.metrics.commit(kind, attempts, time.Since(start), err)
+		span.SetAttributes(attribute.Int("catalog.attempts", attempts), attribute.String("catalog.outcome", outcome))
+
+		if outcome == "state_unknown" || outcome == "unavailable" {
+			span.SetStatus(codes.Error, err.Error())
+		}
+
+		span.End()
+	}()
+
 	var zero T
 
 	for attempt := 0; ; attempt++ {
-		v, err := once()
+		v, err := once(ctx)
 		if err == nil {
 			return v, attempt + 1, nil
 		}
@@ -123,13 +149,22 @@ func (s *Service) commitOnce(ctx context.Context, in CommitInput) (Table, error)
 		return s.LoadTable(ctx, in.Ident)
 	}
 
-	raw, err := s.writeMetadata(ctx, plan.location, plan.updated)
+	locations := []string{plan.location}
+
+	intent, err := s.beginWrite(ctx, []store.Ident{in.Ident}, locations)
 	if err != nil {
 		return Table{}, err
 	}
 
-	if _, err := s.store.CommitTables(ctx, []store.Commit{plan.commit()}); err != nil {
-		return Table{}, s.handleFailedPointerWrite(ctx, err, plan.location)
+	raw, err := s.writeMetadata(ctx, plan.location, plan.updated)
+	if err != nil {
+		s.abandonWrite(ctx, intent, locations, "writing the metadata file failed")
+
+		return Table{}, err
+	}
+
+	if _, err := s.store.CommitTables(ctx, []store.Commit{plan.commit(intent)}); err != nil {
+		return Table{}, s.handleFailedPointerWrite(ctx, err, intent, locations)
 	}
 
 	s.deleteExpiredMetadata(ctx, current, plan.updated)
@@ -147,8 +182,13 @@ type plannedCommit struct {
 	location string
 }
 
-func (p *plannedCommit) commit() store.Commit {
-	return store.Commit{Ident: p.ident, ExpectedVersion: p.ptr.Version, MetadataLocation: p.location}
+func (p *plannedCommit) commit(intent store.IntentRef) store.Commit {
+	return store.Commit{
+		Ident:            p.ident,
+		ExpectedVersion:  p.ptr.Version,
+		MetadataLocation: p.location,
+		Intent:           intent,
+	}
 }
 
 // planCommit checks the requirements of in against current, the table's
@@ -218,40 +258,49 @@ func (s *Service) loadForCommit(ctx context.Context, in CommitInput) (store.Poin
 }
 
 // handleFailedPointerWrite classifies a failed pointer update after new
-// metadata files were written to locations, and cleans up when that is safe.
-func (s *Service) handleFailedPointerWrite(ctx context.Context, err error, locations ...string) error {
+// metadata files were written to locations under intent, and cleans up when
+// the pointers certainly did not move.
+func (s *Service) handleFailedPointerWrite(
+	ctx context.Context,
+	err error,
+	intent store.IntentRef,
+	locations []string,
+) error {
 	lostRace := errors.Is(err, store.ErrCommitConflict) ||
 		errors.Is(err, store.ErrTableAlreadyExists) ||
 		errors.Is(err, store.ErrTableNotFound) ||
-		errors.Is(err, store.ErrViewNotFound)
+		errors.Is(err, store.ErrViewNotFound) ||
+		errors.Is(err, store.ErrIntentChanged)
 	rejected := errors.Is(err, store.ErrViewAlreadyExists) ||
 		errors.Is(err, store.ErrNamespaceNotFound) ||
 		errors.Is(err, store.ErrInvalidArgument)
 
 	switch {
 	case lostRace:
-		s.deleteFiles(ctx, locations, "commit lost a race")
+		s.abandonWrite(ctx, intent, locations, "commit lost a race")
 
 		return fmt.Errorf("%w: %w", errRetry, err)
 	case rejected:
-		s.deleteFiles(ctx, locations, "commit rejected")
+		s.abandonWrite(ctx, intent, locations, "commit rejected")
+
+		return err
+	case store.IsDefinitelyNotApplied(err):
+		// The store was unreachable before the write was sent: nothing
+		// moved, and the client gets a plain "service unavailable".
+		s.abandonWrite(ctx, intent, locations, "store unavailable")
 
 		return err
 	default:
 		// The pointers may or may not have moved: the new files must stay,
-		// and the client must not clean up either.
+		// and the client must not clean up either. If the commit did not
+		// land, the janitor finds its intent.
 		s.logFor(ctx).ErrorContext(ctx, "commit state unknown",
 			slog.Any("locations", locations),
+			slog.String("intent", intent.ID),
 			logger.Err(err),
 		)
 
 		return fmt.Errorf("%w: %w", ErrCommitStateUnknown, err)
-	}
-}
-
-func (s *Service) deleteFiles(ctx context.Context, locations []string, reason string) {
-	for _, location := range locations {
-		s.deleteFile(ctx, location, reason)
 	}
 }
 

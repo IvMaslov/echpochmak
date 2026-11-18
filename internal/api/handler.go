@@ -6,6 +6,9 @@ import (
 	"net/http"
 	"time"
 
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel/trace"
+
 	"echpochmak/internal/api/gen"
 	"echpochmak/internal/idempotency"
 	"echpochmak/internal/logger"
@@ -45,6 +48,13 @@ type Options struct {
 	Idempotency *idempotency.Guard
 	// Docs serves the Swagger UI at /docs and the spec at /openapi.json.
 	Docs bool
+	// Metrics records request metrics; nil records nothing.
+	Metrics *Metrics
+	// MetricsHandler, when set, is served at /metrics.
+	MetricsHandler http.Handler
+	// TracerProvider, when set, traces every request except the probes and
+	// /metrics, continuing an incoming W3C trace context.
+	TracerProvider trace.TracerProvider
 }
 
 // NewHandler returns the HTTP handler of the catalog server: the Iceberg REST
@@ -53,7 +63,11 @@ func NewHandler(opts Options) http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET "+pathHealthz, handleHealthz)
-	mux.HandleFunc("GET "+pathReadyz, readyzHandler(opts.Ready, opts.Draining))
+	mux.HandleFunc("GET "+pathReadyz, readyzHandler(opts.Ready, opts.Draining, opts.Metrics))
+	if opts.MetricsHandler != nil {
+		mux.Handle("GET "+pathMetrics, opts.MetricsHandler)
+	}
+
 	if opts.Docs {
 		mountDocs(mux, opts)
 	}
@@ -78,8 +92,17 @@ func NewHandler(opts Options) http.Handler {
 
 	routed := withRoute(mux)
 
-	return withRequestLogging(opts.Logger, withRecovery(withRawBody(maxBody,
+	h := withRequestLogging(opts.Logger, opts.Metrics, withRecovery(withRawBody(maxBody,
 		withIdempotency(opts.Idempotency, opts.Server.loadMetadata, mux, routed))))
+
+	if opts.TracerProvider == nil {
+		return h
+	}
+
+	return otelhttp.NewHandler(h, "catalog",
+		otelhttp.WithTracerProvider(opts.TracerProvider),
+		otelhttp.WithFilter(func(r *http.Request) bool { return !isProbe(r) }),
+	)
 }
 
 // mountDocs adds the API documentation routes. They are a convenience, so a
@@ -111,9 +134,10 @@ func handleHealthz(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, r, http.StatusOK, probeResponse{Status: "ok"})
 }
 
-func readyzHandler(s Pinger, draining func() bool) http.HandlerFunc {
+func readyzHandler(s Pinger, draining func() bool, m *Metrics) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if draining != nil && draining() {
+			m.setReady(false)
 			writeJSON(w, r, http.StatusServiceUnavailable, probeResponse{Status: "draining"})
 
 			return
@@ -123,12 +147,14 @@ func readyzHandler(s Pinger, draining func() bool) http.HandlerFunc {
 		defer cancel()
 
 		if err := s.Ping(ctx); err != nil {
+			m.setReady(false)
 			logger.FromContext(ctx).WarnContext(ctx, "store not ready", logger.Err(err))
 			writeJSON(w, r, http.StatusServiceUnavailable, probeResponse{Status: "unavailable"})
 
 			return
 		}
 
+		m.setReady(true)
 		writeJSON(w, r, http.StatusOK, probeResponse{Status: "ok"})
 	}
 }

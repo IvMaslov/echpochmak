@@ -22,6 +22,11 @@ import (
 	// Registers the s3:// scheme with iceberg-go's file IO.
 	_ "github.com/apache/iceberg-go/io/gocloud/s3"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
+	"go.opentelemetry.io/otel/trace"
+	"google.golang.org/grpc"
+
 	"echpochmak/internal/api"
 	"echpochmak/internal/catalog"
 	"echpochmak/internal/config"
@@ -29,9 +34,12 @@ import (
 	"echpochmak/internal/idempotency"
 	"echpochmak/internal/kv/client"
 	"echpochmak/internal/logger"
+	"echpochmak/internal/metrics"
 	"echpochmak/internal/store"
+	"echpochmak/internal/store/instrumented"
 	"echpochmak/internal/store/memstore"
 	"echpochmak/internal/store/raftstore"
+	"echpochmak/internal/telemetry"
 	"echpochmak/internal/version"
 )
 
@@ -67,7 +75,13 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	b, err := newBackend(cfg.Store, log)
+	obs, err := newObservability(ctx)
+	if err != nil {
+		return err
+	}
+	defer obs.shutdown(log)
+
+	b, err := newBackend(cfg.Store, obs, log)
 	if err != nil {
 		return err
 	}
@@ -76,40 +90,40 @@ func run() error {
 	// Storage clients must keep working while in-flight requests drain after
 	// a shutdown signal cancels ctx.
 	storageCtx := context.WithoutCancel(ctx)
-	files := fileio.NewCached(fileio.NewIceberg(storageCtx, cfg.S3.IOProps()), cfg.Catalog.MetadataCacheSize)
+	st := instrumented.New(b.store, obs.store, obs.tracer())
+	s3 := fileio.NewIceberg(storageCtx, cfg.S3.IOProps())
+	files := fileio.NewCached(
+		fileio.NewInstrumented(s3, obs.files, obs.tracer()),
+		cfg.Catalog.MetadataCacheSize,
+		fileio.WithLookupObserver(obs.files.ObserveLookup),
+	)
+
+	replica := replicaName()
 	svc := catalog.New(catalog.Options{
-		Store:         b.store,
+		Store:         st,
 		Files:         files,
 		Warehouse:     cfg.S3.Warehouse,
 		CommitRetries: cfg.Catalog.CommitRetries,
+		Owner:         replica,
 		Logger:        log,
+		Metrics:       obs.catalog,
+		Tracer:        obs.tracer(),
 	})
 
 	guard := newGuard(ctx, cfg, b.records, log)
 
-	// The purger reads each file once; it must not evict table metadata from
-	// the cache.
-	purger := startPurger(ctx, cfg.Catalog, b.store, fileio.NewIceberg(storageCtx, cfg.S3.IOProps()), log)
+	// The background workers read each file once; they must not evict table
+	// metadata from the cache.
+	purger := startPurger(ctx, cfg.Catalog, st, s3, replica, obs, log)
 	defer purger.wait()
 
-	serverOpts := []api.ServerOption{}
-	if guard != nil {
-		serverOpts = append(serverOpts, api.WithIdempotencyLifetime(guard.Lifetime()))
-	}
+	startJanitor(ctx, cfg, st, s3, obs.catalog, log)
 
 	var draining atomic.Bool
 
 	srv := &http.Server{
-		Addr: cfg.HTTP.Addr,
-		Handler: api.NewHandler(api.Options{
-			Logger:       log,
-			Ready:        svc,
-			Draining:     draining.Load,
-			Server:       api.NewServer(svc, cfg.Catalog.Name, serverOpts...),
-			MaxBodyBytes: cfg.HTTP.MaxBodyBytes,
-			Idempotency:  guard,
-			Docs:         cfg.HTTP.Docs,
-		}),
+		Addr:              cfg.HTTP.Addr,
+		Handler:           newHandler(cfg, svc, guard, obs, draining.Load, log),
 		ReadHeaderTimeout: cfg.HTTP.ReadHeaderTimeout,
 		ReadTimeout:       cfg.HTTP.ReadTimeout,
 		WriteTimeout:      cfg.HTTP.WriteTimeout,
@@ -121,6 +135,99 @@ func run() error {
 	}
 
 	return serve(ctx, srv, cfg.HTTP, &draining, log)
+}
+
+// newHandler builds the HTTP handler of the catalog API, the probes, the
+// docs and /metrics.
+func newHandler(
+	cfg config.Config,
+	svc *catalog.Service,
+	guard *idempotency.Guard,
+	obs observability,
+	draining func() bool,
+	log *slog.Logger,
+) http.Handler {
+	serverOpts := []api.ServerOption{}
+	if guard != nil {
+		serverOpts = append(serverOpts, api.WithIdempotencyLifetime(guard.Lifetime()))
+	}
+
+	opts := api.Options{
+		Logger:       log,
+		Ready:        svc,
+		Draining:     draining,
+		Server:       api.NewServer(svc, cfg.Catalog.Name, serverOpts...),
+		MaxBodyBytes: cfg.HTTP.MaxBodyBytes,
+		Idempotency:  guard,
+		Docs:         cfg.HTTP.Docs,
+		Metrics:      obs.api,
+	}
+
+	if cfg.HTTP.Metrics {
+		opts.MetricsHandler = metrics.Handler(obs.reg)
+	}
+
+	if obs.tracing.Enabled {
+		opts.TracerProvider = obs.tracing.Provider
+	}
+
+	return api.NewHandler(opts)
+}
+
+// observability holds the metrics registry, the tracer provider and the
+// metrics of every package; see arch/phase5/plan.md (D8, D9).
+type observability struct {
+	reg     *prometheus.Registry
+	tracing telemetry.Tracing
+	kv      *client.Metrics
+	store   *instrumented.Metrics
+	files   *fileio.Metrics
+	catalog *catalog.Metrics
+	api     *api.Metrics
+}
+
+func newObservability(ctx context.Context) (observability, error) {
+	tracing, err := telemetry.Setup(ctx, serviceName, os.Getenv)
+	if err != nil {
+		return observability{}, err
+	}
+
+	reg := metrics.NewRegistry(serviceName)
+
+	return observability{
+		reg:     reg,
+		tracing: tracing,
+		kv:      client.NewMetrics(reg),
+		store:   instrumented.NewMetrics(reg),
+		files:   fileio.NewMetrics(reg),
+		catalog: catalog.NewMetrics(reg),
+		api:     api.NewMetrics(reg),
+	}, nil
+}
+
+func (o observability) tracer() trace.Tracer {
+	return o.tracing.Tracer()
+}
+
+// kvDialOptions trace KV calls when tracing is on.
+func (o observability) kvDialOptions() []grpc.DialOption {
+	if !o.tracing.Enabled {
+		return nil
+	}
+
+	return []grpc.DialOption{
+		grpc.WithStatsHandler(otelgrpc.NewClientHandler(otelgrpc.WithTracerProvider(o.tracing.Provider))),
+	}
+}
+
+// shutdown flushes the spans not exported yet.
+func (o observability) shutdown(log *slog.Logger) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := o.tracing.Shutdown(ctx); err != nil {
+		log.WarnContext(ctx, "flushing traces failed", logger.Err(err))
+	}
 }
 
 // serve runs srv until ctx is cancelled, then shuts it down gracefully: it
@@ -173,7 +280,7 @@ type backend struct {
 	close   func()
 }
 
-func newBackend(cfg config.Store, log *slog.Logger) (backend, error) {
+func newBackend(cfg config.Store, obs observability, log *slog.Logger) (backend, error) {
 	switch cfg.Backend {
 	case config.StoreMemory:
 		return backend{store: memstore.New(), records: idempotency.NewMemoryStore(), close: func() {}}, nil
@@ -182,6 +289,8 @@ func newBackend(cfg config.Store, log *slog.Logger) (backend, error) {
 			Endpoints:      cfg.KVEndpoints,
 			AttemptTimeout: cfg.KVAttemptTimeout,
 			Logger:         log,
+			Metrics:        obs.kv,
+			DialOptions:    obs.kvDialOptions(),
 		})
 		if err != nil {
 			return backend{}, fmt.Errorf("connecting to the KV cluster: %w", err)
@@ -222,6 +331,8 @@ func startPurger(
 	cfg config.Catalog,
 	st store.Store,
 	files fileio.FileIO,
+	owner string,
+	obs observability,
 	log *slog.Logger,
 ) runningPurger {
 	if cfg.PurgeWorkers == 0 {
@@ -230,19 +341,16 @@ func startPurger(
 		return runningPurger{}
 	}
 
-	host, err := os.Hostname()
-	if err != nil {
-		host = "unknown"
-	}
-
 	p := catalog.NewPurger(catalog.PurgerOptions{
 		Store:    st,
 		Files:    files,
-		Owner:    fmt.Sprintf("%s/%d", host, os.Getpid()),
+		Owner:    owner,
 		Workers:  cfg.PurgeWorkers,
 		Lease:    cfg.PurgeLease,
 		Interval: cfg.PurgeInterval,
 		Logger:   log,
+		Metrics:  obs.catalog,
+		Tracer:   obs.tracer(),
 	})
 
 	done := make(chan struct{})
@@ -253,6 +361,44 @@ func startPurger(
 	}()
 
 	return runningPurger{done: done}
+}
+
+// replicaName names this process in purge claims and commit intents.
+func replicaName() string {
+	host, err := os.Hostname()
+	if err != nil {
+		host = "unknown"
+	}
+
+	return fmt.Sprintf("%s/%d", host, os.Getpid())
+}
+
+// startJanitor runs the orphan janitor until ctx is done, unless it is
+// turned off.
+func startJanitor(
+	ctx context.Context,
+	cfg config.Config,
+	st store.Store,
+	files fileio.FileIO,
+	m *catalog.Metrics,
+	log *slog.Logger,
+) {
+	if !cfg.Catalog.OrphanCleanup {
+		log.InfoContext(ctx, "orphan cleanup disabled")
+
+		return
+	}
+
+	j := catalog.NewJanitor(catalog.JanitorOptions{
+		Store:    st,
+		Files:    files,
+		Grace:    cfg.OrphanGrace(),
+		Interval: cfg.Catalog.OrphanInterval,
+		Logger:   log,
+		OnSweep:  m.ObserveSweep,
+	})
+
+	go j.Run(ctx)
 }
 
 // janitorInterval is how often expired idempotency records are deleted.

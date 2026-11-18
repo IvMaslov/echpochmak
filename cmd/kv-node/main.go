@@ -15,16 +15,25 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
+	"google.golang.org/grpc"
 
 	"echpochmak/internal/config"
 	"echpochmak/internal/kv/daemon"
 	"echpochmak/internal/kv/kvpb"
 	"echpochmak/internal/kv/node"
+	"echpochmak/internal/kv/server"
 	"echpochmak/internal/kv/statemachine"
 	"echpochmak/internal/logger"
+	"echpochmak/internal/metrics"
+	"echpochmak/internal/telemetry"
 	"echpochmak/internal/version"
 )
 
@@ -60,10 +69,32 @@ func run() error {
 		slog.Any(logger.KeyConfig, cfg),
 	)
 
-	d, err := start(ctx, cfg, log)
+	reg := metrics.NewRegistry(serviceName)
+
+	tracing, err := telemetry.Setup(ctx, serviceName, os.Getenv)
 	if err != nil {
 		return err
 	}
+
+	defer func() {
+		flushCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+
+		_ = tracing.Shutdown(flushCtx)
+	}()
+
+	d, err := start(ctx, cfg, reg, tracing, log)
+	if err != nil {
+		return err
+	}
+
+	stopHTTP, err := serveHTTP(ctx, cfg, d, reg, log)
+	if err != nil {
+		_ = d.Shutdown(context.WithoutCancel(ctx))
+
+		return err
+	}
+	defer stopHTTP()
 
 	select {
 	case <-ctx.Done():
@@ -82,7 +113,13 @@ func run() error {
 	return nil
 }
 
-func start(ctx context.Context, cfg config.KVNode, log *slog.Logger) (*daemon.Daemon, error) {
+func start(
+	ctx context.Context,
+	cfg config.KVNode,
+	reg *prometheus.Registry,
+	tracing telemetry.Tracing,
+	log *slog.Logger,
+) (*daemon.Daemon, error) {
 	var initial []*kvpb.Member
 
 	if cfg.InitialCluster != "" {
@@ -122,11 +159,17 @@ func start(ctx context.Context, cfg config.KVNode, log *slog.Logger) (*daemon.Da
 			PromoteMaxLag:   cfg.PromoteMaxLag,
 			MaxRequestBytes: cfg.MaxRequestBytes,
 			StateMachine:    statemachine.Options{DedupWindow: cfg.DedupWindow},
+			Tracer:          tracing.Tracer(),
 		},
 		Peer:          peer,
 		Client:        client,
 		JoinEndpoints: cfg.Join,
+		Server:        server.Options{ReadyMaxLag: cfg.ReadyMaxLag, Zone: cfg.Zone},
 		Logger:        log,
+		Registry:      reg,
+		ClientServerOptions: []grpc.ServerOption{
+			grpc.StatsHandler(otelgrpc.NewServerHandler(otelgrpc.WithTracerProvider(tracing.Provider))),
+		},
 	})
 	if err != nil {
 		_ = peer.Close()
@@ -136,4 +179,61 @@ func start(ctx context.Context, cfg config.KVNode, log *slog.Logger) (*daemon.Da
 	}
 
 	return d, nil
+}
+
+// serveHTTP serves /metrics, /healthz and /readyz on the metrics listener,
+// unless it is turned off, and returns a function that stops it.
+//
+// /healthz reports that the process runs; /readyz that the node knows a
+// leader and has applied nearly everything committed.
+func serveHTTP(
+	ctx context.Context,
+	cfg config.KVNode,
+	d *daemon.Daemon,
+	reg *prometheus.Registry,
+	log *slog.Logger,
+) (func(), error) {
+	if cfg.ListenMetrics == "" {
+		return func() {}, nil
+	}
+
+	maxLag := cfg.ReadyMaxLag
+	if maxLag == 0 {
+		maxLag = server.DefaultReadyMaxLag
+	}
+
+	mux := http.NewServeMux()
+	mux.Handle("GET /metrics", metrics.Handler(reg))
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("ok\n"))
+	})
+	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, _ *http.Request) {
+		if !server.Ready(d.Node(), maxLag) {
+			http.Error(w, "no leader, or applying far behind the commit index", http.StatusServiceUnavailable)
+
+			return
+		}
+
+		_, _ = w.Write([]byte("ok\n"))
+	})
+
+	l, err := (&net.ListenConfig{}).Listen(ctx, "tcp", cfg.ListenMetrics)
+	if err != nil {
+		return nil, fmt.Errorf("listening for metrics: %w", err)
+	}
+
+	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+
+	go func() {
+		if err := srv.Serve(l); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.ErrorContext(ctx, "metrics server failed", logger.Err(err))
+		}
+	}()
+
+	return func() {
+		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+
+		_ = srv.Shutdown(shutdownCtx)
+	}, nil
 }

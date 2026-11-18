@@ -12,6 +12,9 @@ import (
 	"time"
 
 	"github.com/apache/iceberg-go/table"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/noop"
 
 	"echpochmak/internal/fileio"
 	"echpochmak/internal/logger"
@@ -48,6 +51,10 @@ type PurgerOptions struct {
 	Logger   *slog.Logger
 	// Now returns the current time; tests replace it.
 	Now func() time.Time
+	// Metrics records purges; nil records nothing.
+	Metrics *Metrics
+	// Tracer traces purges; nil traces nothing.
+	Tracer trace.Tracer
 }
 
 // Purger deletes the files of tables dropped with purge. Every replica runs
@@ -83,6 +90,10 @@ func NewPurger(opts PurgerOptions) *Purger {
 
 	if opts.Now == nil {
 		opts.Now = time.Now
+	}
+
+	if opts.Tracer == nil {
+		opts.Tracer = noop.NewTracerProvider().Tracer("")
 	}
 
 	return &Purger{
@@ -123,6 +134,13 @@ func (p *Purger) Scan(ctx context.Context) {
 
 		return
 	}
+
+	var oldest time.Time
+	if len(tasks) > 0 {
+		oldest = tasks[0].Created
+	}
+
+	p.opts.Metrics.purgeScanned(oldest)
 
 	for i := range tasks {
 		task := tasks[i]
@@ -192,6 +210,10 @@ func (p *Purger) setRunning(id string, running bool) {
 // purge runs one claimed task. On failure the task keeps its claim, which
 // expires, and a later scan retries it.
 func (p *Purger) purge(ctx context.Context, task store.PurgeTask) {
+	ctx, span := p.opts.Tracer.Start(ctx, "catalog.purge",
+		trace.WithAttributes(attribute.String("catalog.table", task.Ident.String())))
+	defer span.End()
+
 	log := p.opts.Logger.With(
 		slog.String(logger.KeyTable, task.Ident.String()),
 		slog.String("task", task.ID),
@@ -200,6 +222,7 @@ func (p *Purger) purge(ctx context.Context, task store.PurgeTask) {
 
 	files, kept, err := p.collect(ctx, task.MetadataLocation)
 	if err != nil {
+		p.opts.Metrics.purged(0, err)
 		log.WarnContext(ctx, "purge: collecting files failed; retrying later", logger.Err(err))
 
 		return
@@ -212,16 +235,20 @@ func (p *Purger) purge(ctx context.Context, task store.PurgeTask) {
 
 	task, err = p.deleteAll(ctx, task, files)
 	if err != nil {
+		p.opts.Metrics.purged(0, err)
 		log.WarnContext(ctx, "purge: deleting files failed; retrying later", logger.Err(err))
 
 		return
 	}
 
 	if err := p.opts.Store.CompletePurgeTask(ctx, task); err != nil {
+		p.opts.Metrics.purged(0, err)
 		log.WarnContext(ctx, "purge: completing the task failed", logger.Err(err))
 
 		return
 	}
+
+	p.opts.Metrics.purged(len(files), nil)
 
 	log.InfoContext(ctx, "table purged",
 		slog.Int("files_deleted", len(files)),

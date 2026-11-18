@@ -15,6 +15,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/noop"
 
 	"echpochmak/internal/fileio"
 	"echpochmak/internal/logger"
@@ -37,7 +39,13 @@ type Options struct {
 	// CommitRetries is how many times a commit is retried after a concurrent
 	// change, as long as its requirements still hold.
 	CommitRetries int
-	Logger        *slog.Logger
+	// Owner names this replica in commit intents, for logs.
+	Owner  string
+	Logger *slog.Logger
+	// Metrics records commits; nil records nothing.
+	Metrics *Metrics
+	// Tracer traces commits; nil traces nothing.
+	Tracer trace.Tracer
 
 	// NewUUID generates table UUIDs. Defaults to random UUIDs; tests replace
 	// it for deterministic locations.
@@ -54,7 +62,10 @@ type Service struct {
 	files     fileio.FileIO
 	warehouse string
 	retries   int
+	owner     string
 	log       *slog.Logger
+	metrics   *Metrics
+	tracer    trace.Tracer
 	newUUID   func() uuid.UUID
 	backoff   func(attempt int) time.Duration
 }
@@ -66,6 +77,9 @@ func New(opts Options) *Service {
 		files:     opts.Files,
 		warehouse: strings.TrimSuffix(opts.Warehouse, "/"),
 		retries:   opts.CommitRetries,
+		owner:     opts.Owner,
+		metrics:   opts.Metrics,
+		tracer:    opts.Tracer,
 		log:       opts.Logger,
 		newUUID:   opts.NewUUID,
 		backoff:   opts.Backoff,
@@ -81,6 +95,10 @@ func New(opts Options) *Service {
 
 	if s.backoff == nil {
 		s.backoff = jitteredBackoff
+	}
+
+	if s.tracer == nil {
+		s.tracer = noop.NewTracerProvider().Tracer("")
 	}
 
 	return s

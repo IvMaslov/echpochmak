@@ -10,7 +10,8 @@ import (
 type clusterService struct {
 	kvpb.UnimplementedClusterServiceServer
 
-	n *node.Node
+	n    *node.Node
+	zone string
 }
 
 func (s *clusterService) header() *kvpb.ResponseHeader {
@@ -96,5 +97,6 @@ func (s *clusterService) Status(context.Context, *kvpb.StatusRequest) (*kvpb.Sta
 		CommitIndex:  st.Commit,
 		AppliedIndex: st.Applied,
 		Followers:    followers,
+		Zone:         s.zone,
 	}, nil
 }

@@ -44,6 +44,34 @@ func BenchmarkStore(b *testing.B) {
 			}
 		})
 
+		// What the catalog does on every attempt since Phase 5: record an
+		// intent, then commit with it.
+		b.Run(name+"/commit-with-intent", func(b *testing.B) {
+			s := backends[name](b)
+			current := setup(b, s)
+
+			b.ResetTimer()
+
+			for range b.N {
+				intent, err := s.CreateIntent(b.Context(), store.Intent{Locations: []string{"s3://w/next"}})
+				if err != nil {
+					b.Fatal(err)
+				}
+
+				ps, err := s.CommitTables(b.Context(), []store.Commit{{
+					Ident:            current.Ident,
+					ExpectedVersion:  current.Version,
+					MetadataLocation: "s3://w/next",
+					Intent:           intent.Ref(),
+				}})
+				if err != nil {
+					b.Fatal(err)
+				}
+
+				current = ps[0]
+			}
+		})
+
 		b.Run(name+"/get", func(b *testing.B) {
 			s := backends[name](b)
 			current := setup(b, s)

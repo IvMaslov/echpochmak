@@ -26,7 +26,9 @@ type Store struct {
 	tables     map[string]store.Pointer
 	views      map[string]store.Pointer
 	purges     map[string]store.PurgeTask
-	// now returns the time recorded as a purge task's creation time.
+	intents    map[string]store.Intent
+	// now returns the time recorded as a purge task's or an intent's
+	// creation time.
 	now func() time.Time
 }
 
@@ -39,6 +41,7 @@ func New() *Store {
 		tables:     map[string]store.Pointer{},
 		views:      map[string]store.Pointer{},
 		purges:     map[string]store.PurgeTask{},
+		intents:    map[string]store.Intent{},
 		now:        time.Now,
 	}
 }
@@ -270,6 +273,11 @@ func (s *Store) CommitTables(ctx context.Context, commits []store.Commit) ([]sto
 		return nil, err
 	}
 
+	intent, err := store.CommitsIntent(commits)
+	if err != nil {
+		return nil, err
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -278,6 +286,10 @@ func (s *Store) CommitTables(ctx context.Context, commits []store.Commit) ([]sto
 		if err := s.checkCommit(c, s.tables, store.ErrTableNotFound); err != nil {
 			return nil, err
 		}
+	}
+
+	if err := s.takeIntent(intent); err != nil {
+		return nil, err
 	}
 
 	version := s.nextVersion()
@@ -355,6 +367,10 @@ func (s *Store) CommitView(ctx context.Context, commit store.Commit) (store.Poin
 	defer s.mu.Unlock()
 
 	if err := s.checkCommit(commit, s.views, store.ErrViewNotFound); err != nil {
+		return store.Pointer{}, err
+	}
+
+	if err := s.takeIntent(commit.Intent); err != nil {
 		return store.Pointer{}, err
 	}
 
@@ -446,6 +462,126 @@ func (s *Store) CompletePurgeTask(ctx context.Context, task store.PurgeTask) err
 	s.nextVersion()
 
 	return nil
+}
+
+// CreateIntent implements [store.Store].
+func (s *Store) CreateIntent(ctx context.Context, intent store.Intent) (store.Intent, error) {
+	if err := ctxErr(ctx); err != nil {
+		return store.Intent{}, err
+	}
+
+	if err := intent.Validate(); err != nil {
+		return store.Intent{}, err
+	}
+
+	id, err := store.NewIntentID()
+	if err != nil {
+		return store.Intent{}, err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	stored := cloneIntent(intent)
+	stored.ID = id
+	stored.Created = s.now()
+	stored.Condemned = false
+	stored.Version = s.nextVersion()
+	s.intents[id] = stored
+
+	return cloneIntent(stored), nil
+}
+
+// ListIntents implements [store.Store].
+func (s *Store) ListIntents(ctx context.Context, limit int) ([]store.Intent, error) {
+	if err := ctxErr(ctx); err != nil {
+		return nil, err
+	}
+
+	if limit <= 0 {
+		return nil, fmt.Errorf("%w: non-positive limit %d", store.ErrInvalidArgument, limit)
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	ids := slices.Sorted(maps.Keys(s.intents))
+	ids = ids[:min(limit, len(ids))]
+	intents := make([]store.Intent, 0, len(ids))
+
+	for _, id := range ids {
+		intents = append(intents, cloneIntent(s.intents[id]))
+	}
+
+	return intents, nil
+}
+
+// CondemnIntent implements [store.Store].
+func (s *Store) CondemnIntent(ctx context.Context, ref store.IntentRef) (store.Intent, error) {
+	if err := ctxErr(ctx); err != nil {
+		return store.Intent{}, err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	current, err := s.intentAt(ref)
+	if err != nil {
+		return store.Intent{}, err
+	}
+
+	current.Condemned = true
+	current.Version = s.nextVersion()
+	s.intents[current.ID] = current
+
+	return cloneIntent(current), nil
+}
+
+// ReleaseIntent implements [store.Store].
+func (s *Store) ReleaseIntent(ctx context.Context, ref store.IntentRef) error {
+	if err := ctxErr(ctx); err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, err := s.intentAt(ref); err != nil {
+		return err
+	}
+
+	delete(s.intents, ref.ID)
+	s.nextVersion()
+
+	return nil
+}
+
+// takeIntent removes the intent a commit names, after checking it is still
+// at its version; a zero ref is no intent. It must be called with s.mu held,
+// after every other check of the commit passed.
+func (s *Store) takeIntent(ref store.IntentRef) error {
+	if ref.IsZero() {
+		return nil
+	}
+
+	if _, err := s.intentAt(ref); err != nil {
+		return err
+	}
+
+	delete(s.intents, ref.ID)
+
+	return nil
+}
+
+// intentAt returns the stored intent, if it is still at ref's version. It
+// must be called with s.mu held.
+func (s *Store) intentAt(ref store.IntentRef) (store.Intent, error) {
+	current, ok := s.intents[ref.ID]
+	if !ok || current.Version != ref.Version {
+		return store.Intent{}, fmt.Errorf("%w: %q", store.ErrIntentChanged, ref.ID)
+	}
+
+	return current, nil
 }
 
 // purgeTaskAt returns the stored task, if it is still at task's version. It
@@ -762,6 +898,19 @@ func clonePurgeTask(t store.PurgeTask) store.PurgeTask {
 	t.Ident = cloneIdent(t.Ident)
 
 	return t
+}
+
+func cloneIntent(i store.Intent) store.Intent {
+	i.Locations = slices.Clone(i.Locations)
+
+	idents := make([]store.Ident, 0, len(i.Idents))
+	for _, id := range i.Idents {
+		idents = append(idents, cloneIdent(id))
+	}
+
+	i.Idents = idents
+
+	return i
 }
 
 func cloneNamespaceRecord(rec store.NamespaceRecord) store.NamespaceRecord {

@@ -1,0 +1,45 @@
+syntax = "proto3";
+
+package echpochmak.kv.v1;
+
+option go_package = "echpochmak/internal/kv/kvpb;kvpb";
+
+import "echpochmak/kv/v1/cluster.proto";
+
+// MaintenanceService serves operations for backups and restores.
+service MaintenanceService {
+  // ExportSnapshot streams a consistent snapshot of the replicated state in the
+  // snapshot file format (internal/kv/snapshot). The snapshot contains every
+  // write acknowledged anywhere in the cluster before the call. The first
+  // response carries the header; every response may carry file bytes.
+  rpc ExportSnapshot(ExportSnapshotRequest) returns (stream ExportSnapshotResponse);
+}
+
+message ExportSnapshotRequest {}
+
+message ExportSnapshotResponse {
+  // Set in the first response only.
+  SnapshotHeader header = 1;
+  // The next bytes of the snapshot file.
+  bytes chunk = 2;
+}
+
+// SnapshotHeader describes a snapshot. It is written at the start of a
+// snapshot file, after the magic and the format version.
+message SnapshotHeader {
+  // The cluster the snapshot was taken from.
+  string cluster_id = 1;
+  // The node that served it.
+  uint64 node_id = 2;
+  // Raft index and term of the last entry the snapshot contains.
+  uint64 index = 3;
+  uint64 term = 4;
+  // KV revision of the snapshot.
+  int64 revision = 5;
+  // Members of the cluster at the snapshot.
+  repeated Member members = 6;
+  // When the snapshot was taken, in Unix nanoseconds.
+  int64 created_unix_nano = 7;
+  // Version of the kv-node that served it.
+  string version = 8;
+}

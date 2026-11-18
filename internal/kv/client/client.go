@@ -61,6 +61,11 @@ type Config struct {
 	Backoff        time.Duration
 	MaxBackoff     time.Duration
 	Logger         *slog.Logger
+	// Metrics counts attempts; nil counts nothing.
+	Metrics *Metrics
+	// DialOptions are extra gRPC options of every connection, such as a
+	// tracing stats handler.
+	DialOptions []grpc.DialOption
 }
 
 // Client talks to a KV cluster. It is safe for concurrent use.
@@ -97,7 +102,9 @@ func New(cfg Config) (*Client, error) {
 	c := &Client{cfg: cfg}
 
 	for _, ep := range cfg.Endpoints {
-		conn, err := grpc.NewClient(target(ep), grpc.WithTransportCredentials(insecure.NewCredentials()))
+		opts := append([]grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}, cfg.DialOptions...)
+
+		conn, err := grpc.NewClient(target(ep), opts...)
 		if err != nil {
 			_ = c.Close()
 
@@ -232,20 +239,25 @@ func (c *Client) do(ctx context.Context, retryUnknown bool, call func(ctx contex
 
 		if err == nil {
 			c.current.Store(int64(i))
+			c.cfg.Metrics.attempt(attemptOK)
 
 			return nil
 		}
 
 		switch classify(err) {
 		case final:
+			c.cfg.Metrics.attempt(attemptFailed)
+
 			return finalError(err)
 		case unknown:
 			sawUnknown = true
+			c.cfg.Metrics.attempt(attemptUnknown)
 
 			if !retryUnknown {
 				return fmt.Errorf("%w: %w", ErrOutcomeUnknown, err)
 			}
 		case retryElsewhere:
+			c.cfg.Metrics.attempt(attemptRetried)
 		}
 
 		c.cfg.Logger.DebugContext(ctx, "kv attempt failed",

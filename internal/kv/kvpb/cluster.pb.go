@@ -688,7 +688,9 @@ type StatusResponse struct {
 	CommitIndex  uint64 `protobuf:"varint,5,opt,name=commit_index,json=commitIndex,proto3" json:"commit_index,omitempty"`
 	AppliedIndex uint64 `protobuf:"varint,6,opt,name=applied_index,json=appliedIndex,proto3" json:"applied_index,omitempty"`
 	// Followers, when this node is the leader.
-	Followers     []*FollowerProgress `protobuf:"bytes,7,rep,name=followers,proto3" json:"followers,omitempty"`
+	Followers []*FollowerProgress `protobuf:"bytes,7,rep,name=followers,proto3" json:"followers,omitempty"`
+	// The node's placement label, such as an availability zone.
+	Zone          string `protobuf:"bytes,8,opt,name=zone,proto3" json:"zone,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -770,6 +772,13 @@ func (x *StatusResponse) GetFollowers() []*FollowerProgress {
 		return x.Followers
 	}
 	return nil
+}
+
+func (x *StatusResponse) GetZone() string {
+	if x != nil {
+		return x.Zone
+	}
+	return ""
 }
 
 // ErrorDetail is attached to error statuses. Clients use it to tell a write
@@ -870,7 +879,7 @@ const file_echpochmak_kv_v1_cluster_proto_rawDesc = "" +
 	"\x02id\x18\x01 \x01(\x04R\x02id\x12\x14\n" +
 	"\x05match\x18\x02 \x01(\x04R\x05match\x12\x14\n" +
 	"\x05state\x18\x03 \x01(\tR\x05state\x12\x18\n" +
-	"\alearner\x18\x04 \x01(\bR\alearner\"\xaf\x02\n" +
+	"\alearner\x18\x04 \x01(\bR\alearner\"\xc3\x02\n" +
 	"\x0eStatusResponse\x128\n" +
 	"\x06header\x18\x01 \x01(\v2 .echpochmak.kv.v1.ResponseHeaderR\x06header\x12\x1d\n" +
 	"\n" +
@@ -880,7 +889,8 @@ const file_echpochmak_kv_v1_cluster_proto_rawDesc = "" +
 	"raft_state\x18\x04 \x01(\tR\traftState\x12!\n" +
 	"\fcommit_index\x18\x05 \x01(\x04R\vcommitIndex\x12#\n" +
 	"\rapplied_index\x18\x06 \x01(\x04R\fappliedIndex\x12@\n" +
-	"\tfollowers\x18\a \x03(\v2\".echpochmak.kv.v1.FollowerProgressR\tfollowers\"S\n" +
+	"\tfollowers\x18\a \x03(\v2\".echpochmak.kv.v1.FollowerProgressR\tfollowers\x12\x12\n" +
+	"\x04zone\x18\b \x01(\tR\x04zone\"S\n" +
 	"\vErrorDetail\x12'\n" +
 	"\x0foutcome_unknown\x18\x01 \x01(\bR\x0eoutcomeUnknown\x12\x1b\n" +
 	"\tleader_id\x18\x02 \x01(\x04R\bleaderId2\xb2\x04\n" +
